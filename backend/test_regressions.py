@@ -1442,11 +1442,50 @@ async def test_reference_image_prefers_openai(monkeypatch: pytest.MonkeyPatch) -
         "https://example.test/reference.png",
         42,
         "standard",
+        preferred_provider="openai",
     )
 
     assert result.startswith("data:image/png;base64,")
     assert cost.image_generations == 1
     assert fal_called is False
+
+
+def test_image_provider_policy_uses_cost_mode_and_balanced_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        image_gen,
+        "get_config",
+        lambda: SimpleNamespace(
+            image_provider_default="replicate",
+            image_provider_keyframe="openai",
+            image_provider_reference="fal",
+        ),
+    )
+
+    assert image_gen._resolve_image_provider("default", "budget") == "fal"
+    assert image_gen._resolve_image_provider("default", "quality") == "openai"
+    assert image_gen._resolve_image_provider("default", "balanced") == "replicate"
+    assert image_gen._resolve_image_provider("keyframe", "balanced") == "openai"
+    assert image_gen._resolve_image_provider("reference", "balanced") == "fal"
+
+
+def test_invalid_balanced_image_provider_falls_back_to_purpose_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        image_gen,
+        "get_config",
+        lambda: SimpleNamespace(
+            image_provider_default="invalid",
+            image_provider_keyframe="invalid",
+            image_provider_reference="invalid",
+        ),
+    )
+
+    assert image_gen._resolve_image_provider("default", "balanced") == "fal"
+    assert image_gen._resolve_image_provider("keyframe", "balanced") == "openai"
+    assert image_gen._resolve_image_provider("reference", "balanced") == "fal"
 
 
 @pytest.mark.asyncio

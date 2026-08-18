@@ -298,7 +298,9 @@ def make_mock_anthropic_client(agent_responses: dict[str, str] = AGENT_MOCK_RESP
 
 # ── Mock 工具函数 ────────────────────────────────────────────────────────────
 
-async def mock_generate_character_images(candidates, quality_preset="standard"):
+async def mock_generate_character_images(
+    candidates, quality_preset="standard", budget_mode="balanced"
+):
     """返回带 placeholder 图片 URL 的候选人物列表。"""
     print(f"  [mock] generate_character_images input types: {[type(c).__name__ for c in candidates]}")
     result = []
@@ -312,7 +314,9 @@ async def mock_generate_character_images(candidates, quality_preset="standard"):
     return result
 
 
-async def mock_generate_character_reference_pack(characters, quality_preset="standard"):
+async def mock_generate_character_reference_pack(
+    characters, quality_preset="standard", budget_mode="balanced"
+):
     from anime_pipeline.cost_tracker import zero_cost
     from anime_pipeline.models import CharacterReferenceImage, CharacterReferencePack
 
@@ -339,7 +343,9 @@ async def mock_generate_character_reference_pack(characters, quality_preset="sta
     return updated, zero_cost()
 
 
-async def mock_generate_scene_image(scene, quality_preset="standard"):
+async def mock_generate_scene_image(
+    scene, quality_preset="standard", budget_mode="balanced"
+):
     from anime_pipeline.cost_tracker import zero_cost
     path = f"output/images/mock_scene_{scene.index}.png"
     print(f"  [mock] generate_scene_image: {path}")

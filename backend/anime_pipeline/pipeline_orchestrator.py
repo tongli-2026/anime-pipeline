@@ -172,6 +172,7 @@ def _apply_cost_and_persist_state(state: PipelineState, cost: CostRecord) -> Pip
 async def _lock_user_defined_characters(
     user_input: UserInput,
     quality_preset: Literal["draft", "standard", "high"],
+    budget_mode: Literal["budget", "balanced", "quality"],
 ) -> tuple[list[LockedCharacter], list[CharacterCandidate], Any]:
     raw_candidates = [
         CharacterCandidate(
@@ -186,7 +187,9 @@ async def _lock_user_defined_characters(
     needs_generation = [candidate for candidate in raw_candidates if not candidate.preview_image]
     generated_map: dict[str, CharacterCandidate] = {}
     if needs_generation:
-        generated_candidates = await generate_character_images(needs_generation, quality_preset)
+        generated_candidates = await generate_character_images(
+            needs_generation, quality_preset, budget_mode
+        )
         generated_map = {candidate.id: candidate for candidate in generated_candidates}
 
     final_candidates: list[CharacterCandidate] = []
@@ -509,6 +512,7 @@ async def run_pipeline(
             locked, candidates_with_images, combined_cost = await _lock_user_defined_characters(
                 user_input,
                 options.quality_preset,
+                options.budget_mode,
             )
             state = set_candidates(state, candidates_with_images)
             state = apply_cost_and_check_budget(state, combined_cost)
@@ -532,7 +536,7 @@ async def run_pipeline(
                 for c in proposal_result.data
             ]
             candidates_with_images = await generate_character_images(
-                raw_candidates, options.quality_preset
+                raw_candidates, options.quality_preset, options.budget_mode
             )
 
             combined_cost = proposal_result.cost
@@ -599,6 +603,7 @@ async def run_pipeline(
         locked, reference_pack_cost = await generate_character_reference_pack(
             locked,
             options.quality_preset,
+            options.budget_mode,
         )
         state = lock_characters(state, locked)
         state = apply_cost_and_check_budget(state, reference_pack_cost)
@@ -1373,7 +1378,7 @@ async def _run_generation_stage(
                 output = VideoOutput(file_path=file_path, cost=cost)
             else:
                 file_path, cost = await generate_scene_image(
-                    generation_scene, options.quality_preset
+                    generation_scene, options.quality_preset, options.budget_mode
                 )
                 output = ImageOutput(file_path=file_path, transition_type="fade", cost=cost)
 
@@ -1405,7 +1410,9 @@ async def _run_generation_stage(
                     state, scene.id, {"output": VideoOutput(file_path=file_path, cost=cost)}
                 )
             else:
-                file_path, cost = await generate_scene_image(scene, options.quality_preset)
+                file_path, cost = await generate_scene_image(
+                    scene, options.quality_preset, options.budget_mode
+                )
                 state = update_scene(
                     state,
                     scene.id,

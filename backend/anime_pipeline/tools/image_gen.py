@@ -49,12 +49,43 @@ SEEDANCE_TEXT_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"
 SEEDANCE_IMAGE_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/image-to-video"
 DEFAULT_VIDEO_CLIP_SECONDS = 5.0
 ImageProvider = Literal["openai", "fal", "replicate"]
+ImagePurpose = Literal["default", "keyframe", "reference"]
+BudgetMode = Literal["budget", "balanced", "quality"]
 ReferenceTransformation = Literal["identity", "pose", "expression"]
 DEFAULT_REFERENCE_VIEWS = (
     "portrait_three_quarter",
     "full_body_front",
     "expression_sheet",
 )
+
+
+def _resolve_image_provider(purpose: ImagePurpose, budget_mode: BudgetMode) -> ImageProvider:
+    """Resolve the preferred image provider from cost mode and balanced-mode config."""
+    if budget_mode == "budget":
+        return "fal"
+    if budget_mode == "quality":
+        return "openai"
+
+    cfg = get_config()
+    configured = {
+        "default": cfg.image_provider_default,
+        "keyframe": cfg.image_provider_keyframe,
+        "reference": cfg.image_provider_reference,
+    }[purpose].strip().lower()
+    if configured == "openai":
+        return "openai"
+    if configured == "fal":
+        return "fal"
+    if configured == "replicate":
+        return "replicate"
+
+    fallback: dict[ImagePurpose, ImageProvider] = {
+        "default": "fal",
+        "keyframe": "openai",
+        "reference": "fal",
+    }
+    logger.warning("Invalid image provider %r for %s; using %s", configured, purpose, fallback[purpose])
+    return fallback[purpose]
 
 
 def _require_url(value: Any, provider: str) -> str:
@@ -485,10 +516,11 @@ async def _call_image_api_with_reference(
     negative_prompt: str | None = None,
     client: httpx.AsyncClient | None = None,
     transformation: ReferenceTransformation = "identity",
+    preferred_provider: ImageProvider = "fal",
 ) -> tuple[str, CostRecord]:
     """
     Generate an image using a reference image when the provider supports it.
-    Prefer GPT Image 2 high-fidelity editing, then fal.ai image-to-image and text-only.
+    Try the preferred reference-capable provider first, then fall back to text-only generation.
     """
     cfg = get_config()
     if client is None:
@@ -498,43 +530,50 @@ async def _call_image_api_with_reference(
     if negative_prompt:
         effective_prompt = f"{prompt}\n\nAvoid: {negative_prompt}"
 
-    if cfg.openai_api_key and reference_image:
-        try:
-            return await _call_openai_image_edit(
-                effective_prompt,
-                reference_image,
-                quality,
-                client,
-                transformation,
-            )
-        except Exception as exc:
-            logger.warning("OpenAI image edit failed, falling back: %s", exc)
+    reference_url = reference_image if reference_image.startswith("http") else ""
 
-    reference_url = reference_image
-    if reference_image and not reference_image.startswith("http"):
-        reference_path = Path(reference_image)
-        if reference_path.exists():
-            try:
-                reference_url = await _upload_local_file_to_fal(reference_path)
-            except Exception as exc:
-                logger.warning("Failed to upload reference image %s: %s", reference_image, exc)
-
-    if cfg.fal_key and reference_url:
+    provider_order = [
+        preferred_provider,
+        *(provider for provider in ("openai", "fal") if provider != preferred_provider),
+    ]
+    for provider in provider_order:
         try:
-            image_url = await _call_fal_image_to_image(
-                effective_prompt,
-                reference_url,
-                seed,
-                quality,
-                client,
-                transformation,
-            )
-            return image_url, calc_image_cost(1, quality, "fal_edit")
+            if provider == "openai" and cfg.openai_api_key and reference_image:
+                return await _call_openai_image_edit(
+                    effective_prompt,
+                    reference_image,
+                    quality,
+                    client,
+                    transformation,
+                )
+            if provider == "fal" and cfg.fal_key and reference_url:
+                image_url = await _call_fal_image_to_image(
+                    effective_prompt,
+                    reference_url,
+                    seed,
+                    quality,
+                    client,
+                    transformation,
+                )
+                return image_url, calc_image_cost(1, quality, "fal_edit")
+            if provider == "fal" and cfg.fal_key and reference_image and not reference_url:
+                reference_path = Path(reference_image)
+                if reference_path.exists():
+                    reference_url = await _upload_local_file_to_fal(reference_path)
+                    image_url = await _call_fal_image_to_image(
+                        effective_prompt,
+                        reference_url,
+                        seed,
+                        quality,
+                        client,
+                        transformation,
+                    )
+                    return image_url, calc_image_cost(1, quality, "fal_edit")
         except Exception as exc:
-            logger.warning("fal.ai image-to-image failed, falling back to text-only: %s", exc)
+            logger.warning("%s reference generation failed, falling back: %s", provider, exc)
 
     return await _call_image_api(
-        prompt, seed, quality, negative_prompt, client, preferred_provider="openai"
+        prompt, seed, quality, negative_prompt, client, preferred_provider=preferred_provider
     )
 
 
@@ -902,16 +941,23 @@ async def generate_scene_video(
 async def generate_character_images(
     candidates: list[CharacterCandidate],
     quality_preset: Literal["draft", "standard", "high"] = "standard",
+    budget_mode: BudgetMode = "balanced",
 ) -> list[CharacterCandidate]:
     """Generate preview images for all character candidates in parallel."""
     await _ensure_output_dir(OUTPUT_DIR)
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    preferred_provider = _resolve_image_provider("default", budget_mode)
 
     async with httpx.AsyncClient() as client:
 
         async def _generate_one(candidate: CharacterCandidate) -> CharacterCandidate:
             image_url, cost = await _call_image_api(
-                candidate.prompt_base, candidate.seed, quality, None, client
+                candidate.prompt_base,
+                candidate.seed,
+                quality,
+                None,
+                client,
+                preferred_provider=preferred_provider,
             )
             local_path = OUTPUT_DIR / f"char_{candidate.id[:8]}_{candidate.seed}.png"
             try:
@@ -931,10 +977,12 @@ async def generate_character_images(
 async def generate_character_reference_pack(
     characters: list[LockedCharacter],
     quality_preset: Literal["draft", "standard", "high"] = "standard",
+    budget_mode: BudgetMode = "balanced",
 ) -> tuple[list[LockedCharacter], CostRecord]:
     """Generate a cost-aware three-image starter pack for locked primary characters."""
     await _ensure_output_dir(OUTPUT_DIR)
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    preferred_provider = _resolve_image_provider("reference", budget_mode)
     total_cost = zero_cost()
 
     async with httpx.AsyncClient() as client:
@@ -991,6 +1039,7 @@ async def generate_character_reference_pack(
                     negative_prompt,
                     client,
                     transformation,
+                    preferred_provider,
                 )
                 pack_cost = add_costs(pack_cost, image_cost)
 
@@ -1027,15 +1076,22 @@ async def generate_character_reference_pack(
 async def generate_scene_image(
     scene: Scene,
     quality_preset: Literal["draft", "standard", "high"] = "standard",
+    budget_mode: BudgetMode = "balanced",
 ) -> tuple[str, CostRecord]:
     """Generate a still image for a normal scene and download to local file."""
     await _ensure_output_dir(OUTPUT_DIR)
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    preferred_provider = _resolve_image_provider("default", budget_mode)
     prompt = scene.generation_prompt or scene.description
 
     async with httpx.AsyncClient() as client:
         image_url, cost = await _call_image_api(
-            prompt, hash(scene.id) & 0xFFFFFFFF, quality, scene.negative_prompt, client
+            prompt,
+            hash(scene.id) & 0xFFFFFFFF,
+            quality,
+            scene.negative_prompt,
+            client,
+            preferred_provider=preferred_provider,
         )
 
         file_path = OUTPUT_DIR / f"scene_{scene.id[:8]}.png"
@@ -1052,7 +1108,7 @@ async def generate_shot_hybrid(
     shot: Shot,
     quality_preset: Literal["draft", "standard", "high"] = "standard",
     video_provider: VideoProvider = "auto",
-    budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
+    budget_mode: BudgetMode = "balanced",
 ) -> tuple[str, CostRecord, dict[str, str], dict[str, Any]]:
     """
     Hybrid generation path:
@@ -1060,6 +1116,7 @@ async def generate_shot_hybrid(
     2. Generate the motion clip using a prompt augmented with keyframe guidance
     """
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    preferred_provider = _resolve_image_provider("keyframe", budget_mode)
     await _ensure_output_dir(OUTPUT_DIR)
     await _ensure_output_dir(VIDEO_OUTPUT_DIR)
 
@@ -1134,6 +1191,7 @@ async def generate_shot_hybrid(
                     quality,
                     shot.negative_prompt,
                     client,
+                    preferred_provider=preferred_provider,
                 )
             else:
                 image_url, image_cost = await _call_image_api(
@@ -1142,7 +1200,7 @@ async def generate_shot_hybrid(
                     quality,
                     shot.negative_prompt,
                     client,
-                    preferred_provider="openai",
+                    preferred_provider=preferred_provider,
                 )
             total_cost = add_costs(total_cost, image_cost)
 

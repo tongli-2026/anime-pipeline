@@ -188,6 +188,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "negative_prompt": shot.negative_prompt,
             }),
             quality_preset=args.quality_preset,
+            budget_mode=args.budget_mode,
         )
         result = {"mode": "image", "image_path": image_path, "cost_usd": cost.total_cost_usd}
 

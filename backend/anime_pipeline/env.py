@@ -25,6 +25,9 @@ class EnvConfig:
     # ── Image Generation ─────────────────────────────────────
     fal_key: str = ""
     replicate_api_token: str = ""
+    image_provider_default: str = "fal"
+    image_provider_keyframe: str = "openai"
+    image_provider_reference: str = "fal"
 
     # ── Video Generation ─────────────────────────────────────
     seedance_api_key: str = ""
@@ -50,6 +53,9 @@ def _load_config() -> EnvConfig:
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         fal_key=os.environ.get("FAL_KEY", ""),
         replicate_api_token=os.environ.get("REPLICATE_API_TOKEN", ""),
+        image_provider_default=os.environ.get("IMAGE_PROVIDER_DEFAULT", "fal"),
+        image_provider_keyframe=os.environ.get("IMAGE_PROVIDER_KEYFRAME", "openai"),
+        image_provider_reference=os.environ.get("IMAGE_PROVIDER_REFERENCE", "fal"),
         seedance_api_key=os.environ.get("SEEDANCE_API_KEY", ""),
         kling_access_key=os.environ.get("KLING_ACCESS_KEY", ""),
         kling_secret_key=os.environ.get("KLING_SECRET_KEY", ""),

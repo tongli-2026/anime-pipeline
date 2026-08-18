@@ -55,9 +55,19 @@ ordinary scene images prefer fal.ai FLUX Dev. A primary character's starter pack
 generates only three high-value assets: a three-quarter portrait, a front-facing
 full-body view, and an expression sheet. Existing views are reused instead of
 regenerated; side and back views remain available for later shot-driven expansion.
-Reference packs and shot keyframes prefer GPT Image 2 for high-fidelity editing,
-then fall back to fal.ai and Replicate. `OPENAI_API_KEY` is shared with OpenAI TTS;
-API usage is billed separately from a ChatGPT subscription.
+Provider selection follows the active budget mode:
+
+| Mode | Ordinary images | Shot keyframes | Reference packs |
+|------|-----------------|----------------|-----------------|
+| `budget` | fal.ai | fal.ai | fal.ai image-to-image |
+| `balanced` | `IMAGE_PROVIDER_DEFAULT` | `IMAGE_PROVIDER_KEYFRAME` | `IMAGE_PROVIDER_REFERENCE` |
+| `quality` | GPT Image 2 | GPT Image 2 | GPT Image 2 edit |
+
+Balanced mode defaults to `fal`, `openai`, and `fal` respectively. Each variable
+also accepts `openai` or `replicate`; providers that cannot perform a reference
+edit fall back to text-to-image. API failures continue through the configured
+fallback chain. `OPENAI_API_KEY` is shared with OpenAI TTS, and API usage is
+billed separately from a ChatGPT subscription.
 
 fal.ai estimates account for whole-megapixel rounding: approximately $0.025 for
 standard text-to-image and $0.05 for the 16:9 HD preset. GPT Image 2 records cost
