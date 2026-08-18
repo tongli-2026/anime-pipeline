@@ -75,7 +75,6 @@ from anime_pipeline.pipeline_orchestrator import (
 )
 from anime_pipeline.pipeline_state import (
     create_initial_state,
-    deserialize_state,
     record_stage_complete,
     set_story,
 )
@@ -1156,7 +1155,19 @@ def test_scene_prompt_builder_input_for_shots_filters_to_relevant_scene_and_char
 
 
 def test_chunk_shots_for_prompt_builder_splits_large_payloads() -> None:
-    state = deserialize_state(Path("output/state_75ac51ca.json").read_text())
+    shots = [
+        build_example_shot().model_copy(update={"id": f"shot-{index}", "index": index})
+        for index in range(9)
+    ]
+    state = _make_state().model_copy(
+        update={
+            "shot_plan": ShotPlan(
+                story_id="story-1",
+                shots=shots,
+                total_duration_seconds=sum(shot.duration_seconds for shot in shots),
+            )
+        }
+    )
 
     batches = _chunk_shots_for_prompt_builder(state, state.shot_plan.shots)
 
