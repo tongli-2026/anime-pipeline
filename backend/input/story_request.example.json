@@ -1,0 +1,25 @@
+{
+  "concept": "A high school girl who can hear thoughts falls for the only boy she cannot read.",
+  "story_outline": "Hana notices that she can hear every classmate's surface thoughts except Kaito's. Her curiosity pushes her to keep finding excuses to be near him. Kaito is carrying a supernatural burden that isolates him from everyone else. As Hana earns his trust, their connection deepens into a quiet romance. Their emotional turning point happens on the school rooftop at sunset.",
+  "style": "Makoto Shinkai, soft lighting, detailed backgrounds, emotional expressions",
+  "target_duration_seconds": 180,
+  "budget": {
+    "hard_limit_usd": 5.0,
+    "warn_at_usd": 3.5
+  },
+  "primary_characters": [
+    {
+      "name": "Hana",
+      "description": "16-year-old girl with short brown hair, bright amber eyes, and a school uniform",
+      "personality": "Cheerful, empathetic, observant, slightly shy",
+      "motivation": "She wants to understand why Kaito is the only person she cannot read"
+    },
+    {
+      "name": "Kaito",
+      "description": "17-year-old transfer student with dark hair, a guarded expression, and a calm posture",
+      "personality": "Quiet, controlled, kind beneath a distant exterior",
+      "motivation": "He wants to protect others from the supernatural burden he carries",
+      "relationship_to_others": "Hana is the first person he starts to trust"
+    }
+  ]
+}
