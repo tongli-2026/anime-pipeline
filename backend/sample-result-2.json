@@ -1,0 +1,23 @@
+{
+  "mode": "hybrid",
+  "video_path": "output/videos/shot_example-shot-2-48c94cd7.mp4",
+  "cost_usd": 0.185008,
+  "keyframe_paths": {
+    "opening": "output/images/shot_example-shot-1-01b52ffa_ending.png",
+    "ending": "output/images/shot_example-shot-2-48c94cd7_ending.png"
+  },
+  "hybrid_metadata": {
+    "used_reference_image": true,
+    "reference_image_path": "/Users/tong/AIProjects/anime-pipeline/backend/output/images/char_141cf97d_482910.png",
+    "selected_reference_images": [
+      "/Users/tong/AIProjects/anime-pipeline/backend/output/images/char_141cf97d_482910.png"
+    ],
+    "keyframe_generation_mode": "reference_image",
+    "video_generation_mode": "seedance_image_to_video",
+    "video_provider_used": "seedance",
+    "image_to_video_attempted": true,
+    "seedance_image_to_video_attempted": true,
+    "kling_image_to_video_attempted": false,
+    "fallback_reason": null
+  }
+}

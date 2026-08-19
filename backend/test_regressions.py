@@ -1470,6 +1470,15 @@ def test_image_provider_policy_uses_cost_mode_and_balanced_config(
     assert image_gen._resolve_image_provider("reference", "balanced") == "fal"
 
 
+def test_artifact_ids_do_not_collide_for_shared_prefixes() -> None:
+    first = image_gen._artifact_id("example-shot-1")
+    second = image_gen._artifact_id("example-shot-2")
+
+    assert first.startswith("example-shot-1-")
+    assert second.startswith("example-shot-2-")
+    assert first != second
+
+
 def test_invalid_balanced_image_provider_falls_back_to_purpose_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

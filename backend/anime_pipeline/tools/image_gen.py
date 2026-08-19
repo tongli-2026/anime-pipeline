@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import logging
+import re
 import shutil
 import time
 from collections.abc import Collection
@@ -57,6 +59,13 @@ DEFAULT_REFERENCE_VIEWS = (
     "full_body_front",
     "expression_sheet",
 )
+
+
+def _artifact_id(value: str) -> str:
+    """Create a readable, collision-resistant filename component from a model ID."""
+    readable = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-_")[:32] or "item"
+    digest = hashlib.sha256(value.encode()).hexdigest()[:8]
+    return f"{readable}-{digest}"
 
 
 def _resolve_image_provider(purpose: ImagePurpose, budget_mode: BudgetMode) -> ImageProvider:
@@ -382,7 +391,7 @@ async def _call_openai_image_edit(
     client: httpx.AsyncClient,
     transformation: ReferenceTransformation = "identity",
 ) -> tuple[str, CostRecord]:
-    """Edit from a character reference using GPT Image 2 high-fidelity input."""
+    """Edit from a character reference using GPT Image 2."""
     from openai import AsyncOpenAI
 
     if reference_image.startswith("http"):
@@ -404,7 +413,6 @@ async def _call_openai_image_edit(
         prompt=prompt,
         size="1536x1024",
         quality="high" if quality == "hd" else "medium",
-        input_fidelity="high" if transformation == "identity" else "low",
         output_format="png",
     )
     if not edit_response.data:
@@ -927,7 +935,7 @@ async def generate_scene_video(
     )
 
     await _ensure_output_dir(VIDEO_OUTPUT_DIR)
-    file_path = VIDEO_OUTPUT_DIR / f"scene_{scene.id[:8]}.mp4"
+    file_path = VIDEO_OUTPUT_DIR / f"scene_{_artifact_id(scene.id)}.mp4"
 
     if video_url.startswith("http") and "placeholder" not in video_url:
         async with httpx.AsyncClient() as client:
@@ -1043,7 +1051,7 @@ async def generate_character_reference_pack(
                 )
                 pack_cost = add_costs(pack_cost, image_cost)
 
-                local_path = OUTPUT_DIR / f"ref_{character.id[:8]}_{view_type}.png"
+                local_path = OUTPUT_DIR / f"ref_{_artifact_id(character.id)}_{view_type}.png"
                 try:
                     await _materialize_image(image_url, local_path, client)
                 except Exception as exc:
@@ -1094,7 +1102,7 @@ async def generate_scene_image(
             preferred_provider=preferred_provider,
         )
 
-        file_path = OUTPUT_DIR / f"scene_{scene.id[:8]}.png"
+        file_path = OUTPUT_DIR / f"scene_{_artifact_id(scene.id)}.png"
         try:
             await _materialize_image(image_url, file_path, client)
         except Exception as exc:
@@ -1140,15 +1148,20 @@ async def generate_shot_hybrid(
             "Preserve these character anchors exactly:\n- "
             + "\n- ".join(character_anchors)
         )
+    keyframe_paths: dict[str, str] = {}
+    if shot.opening_frame_path and Path(shot.opening_frame_path).is_file():
+        keyframe_paths["opening"] = shot.opening_frame_path
+    if shot.ending_frame_path and Path(shot.ending_frame_path).is_file():
+        keyframe_paths["ending"] = shot.ending_frame_path
+
     keyframe_prompts = []
-    if shot.keyframes.opening_frame_prompt:
+    if shot.keyframes.opening_frame_prompt and "opening" not in keyframe_paths:
         keyframe_prompts.append(("opening", shot.keyframes.opening_frame_prompt))
-    if shot.keyframes.ending_frame_prompt:
+    if shot.keyframes.ending_frame_prompt and "ending" not in keyframe_paths:
         keyframe_prompts.append(("ending", shot.keyframes.ending_frame_prompt))
 
     total_cost = zero_cost()
     keyframe_descriptions: list[str] = []
-    keyframe_paths: dict[str, str] = {}
     metadata: dict[str, Any] = {
         "used_reference_image": False,
         "reference_image_path": None,
@@ -1170,23 +1183,31 @@ async def generate_shot_hybrid(
         metadata["reference_image_path"] = primary_reference_image
         metadata["keyframe_generation_mode"] = "reference_image"
         metadata["selected_reference_images"] = selected_reference_images
-        base_prompt = (
-            f"{base_prompt}\n\n"
-            "Use the reference image only for character identity, face, hair, and outfit continuity. "
-            "Do not copy the reference background, location, lighting setup, or camera framing. "
-            "Follow the shot's requested environment and staging instead."
-        )
 
     async with httpx.AsyncClient() as client:
         for label, keyframe_prompt in keyframe_prompts:
+            frame_reference = primary_reference_image
+            reference_instruction = (
+                "Use the reference only for character identity, face, hair, and outfit. "
+                "Follow the requested environment, lighting, staging, and framing."
+            )
+            if label == "ending" and keyframe_paths.get("opening"):
+                frame_reference = keyframe_paths["opening"]
+                reference_instruction = (
+                    "Treat the opening frame as the exact same shot moments earlier. Preserve the "
+                    "background geometry, rooftop details, lighting direction, camera position, "
+                    "character identity, hair, accessories, and outfit. Change only the requested "
+                    "pose, expression, and subtle action."
+                )
             image_prompt = (
                 f"{base_prompt}\n\n"
-                f"{label.title()} keyframe intent: {keyframe_prompt}"
+                f"{label.title()} keyframe intent: {keyframe_prompt}\n\n"
+                f"Reference instructions: {reference_instruction}"
             )
-            if primary_reference_image:
+            if frame_reference:
                 image_url, image_cost = await _call_image_api_with_reference(
                     image_prompt,
-                    primary_reference_image,
+                    frame_reference,
                     (hash((shot.id, label)) & 0xFFFFFFFF),
                     quality,
                     shot.negative_prompt,
@@ -1204,7 +1225,7 @@ async def generate_shot_hybrid(
                 )
             total_cost = add_costs(total_cost, image_cost)
 
-            file_path = OUTPUT_DIR / f"shot_{shot.id[:8]}_{label}.png"
+            file_path = OUTPUT_DIR / f"shot_{_artifact_id(shot.id)}_{label}.png"
             try:
                 await _materialize_image(image_url, file_path, client)
             except Exception as exc:
@@ -1274,7 +1295,7 @@ async def generate_shot_hybrid(
 
     total_cost = add_costs(total_cost, video_cost)
 
-    file_path = VIDEO_OUTPUT_DIR / f"shot_{shot.id[:8]}.mp4"
+    file_path = VIDEO_OUTPUT_DIR / f"shot_{_artifact_id(shot.id)}.mp4"
     if video_url.startswith("http") and "placeholder" not in video_url:
         async with httpx.AsyncClient() as client:
             await _download_file(video_url, file_path, client)

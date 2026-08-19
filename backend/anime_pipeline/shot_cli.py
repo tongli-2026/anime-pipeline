@@ -1,3 +1,21 @@
+"""CLI for generating a single Shot with the anime-pipeline toolchain.
+
+This module provides a command-line entrypoint to create a single
+`Shot` using the project's generation backends (image, video, hybrid).
+Key responsibilities:
+ - Build or load a `Shot` model (example or from JSON file).
+ - Select the appropriate generator (image / video / hybrid) based on
+     the shot's `estimated_generation_mode`.
+ - Run generation, collect output paths and cost metadata, print JSON
+     results and optionally write metadata to a file.
+
+Main functions:
+ - `build_example_shot()` — construct a sample `Shot` for testing.
+ - `load_shot_from_file()` — read and validate a shot JSON file.
+ - `_run(args)` — async orchestration and generator invocation.
+ - `build_parser()` / `main()` — CLI argument parsing and entrypoint.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -120,6 +138,7 @@ async def _run(args: argparse.Namespace) -> None:
     console.print(Panel("[bold magenta]🎞 Shot Hybrid Generator[/bold magenta]", expand=False))
     if args.show_capabilities:
         print_capabilities_report()
+        return
 
     if args.use_example:
         shot = build_example_shot()
