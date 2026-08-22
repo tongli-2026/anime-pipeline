@@ -1,7 +1,16 @@
 # ==============================================================
-# Cost Tracker — tracks spend across the entire pipeline
+# Cost Tracker — pricing, estimates, and budget checks
 #
-# Pure functions for cost calculation, pricing constants, and budget enforcement.
+# Centralized, pure helpers that encode pricing constants, produce
+# conservative planning estimates, and perform budget enforcement.
+#
+# Key points:
+#  - Rates in `PRICING` are planning/configuration values (update as APIs change).
+#  - `estimate_pipeline_cost()` produces a heuristic up-front estimate for user
+#    warnings; the orchestrator should treat it as advisory rather than exact.
+#  - All calculators return a `CostRecord` (detailed breakdown) for easy aggregation.
+#  - To add or update provider rates, edit the `PRICING` table and corresponding
+#    `calc_*` helpers to reflect billing semantics.
 # ==============================================================
 
 from __future__ import annotations
@@ -142,9 +151,15 @@ def calc_video_cost(
     generation_mode: VideoGenerationMode = "text_to_video",
     quality: Literal["standard", "hd"] = "standard",
     has_end_frame: bool = False,
+    resolution: Literal["480p", "720p", "1080p"] = "720p",
 ) -> CostRecord:
     if provider == "seedance":
-        rate = PRICING["video"]["seedance_v1_5_no_audio"]
+        resolution_multiplier = {
+            "480p": (480 / 720) ** 2,
+            "720p": 1.0,
+            "1080p": (1080 / 720) ** 2,
+        }[resolution]
+        rate = PRICING["video"]["seedance_v1_5_no_audio"] * resolution_multiplier
     elif provider == "runway":
         rate = PRICING["video"]["runway_gen3"]
     elif generation_mode == "image_to_video":
@@ -257,7 +272,14 @@ def estimate_pipeline_cost(
 ) -> CostRecord:
     candidates_per_char = 4
     image_quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    image_provider: Literal["fal", "openai"] = "fal" if quality_preset == "draft" else "openai"
     video_provider: BillableVideoProvider = "seedance"
+    if quality_preset == "draft":
+        video_resolution: Literal["480p", "720p", "1080p"] = "480p"
+    elif quality_preset == "high":
+        video_resolution = "1080p"
+    else:
+        video_resolution = "720p"
 
     # Creative stages use Claude Sonnet; structured planning/output uses GPT-5.4 mini.
     creative_llm_cost = calc_llm_cost(
@@ -276,6 +298,7 @@ def estimate_pipeline_cost(
     char_image_cost = calc_image_cost(
         primary_character_count * candidates_per_char,
         image_quality,
+        image_provider,
     )
 
     # Minimum starter pack: three-quarter portrait, full body, expression sheet.
@@ -290,7 +313,7 @@ def estimate_pipeline_cost(
     estimated_shot_count = scene_count * 2
     hybrid_shot_count = min(estimated_shot_count, key_scene_count * 2)
     still_shot_count = estimated_shot_count - hybrid_shot_count
-    scene_image_cost = calc_image_cost(still_shot_count, image_quality)
+    scene_image_cost = calc_image_cost(still_shot_count, image_quality, image_provider)
     keyframe_cost = calc_image_cost(
         hybrid_shot_count * 2,
         image_quality,
@@ -299,7 +322,10 @@ def estimate_pipeline_cost(
 
     video_cost = zero_cost()
     for _ in range(hybrid_shot_count):
-        video_cost = add_costs(video_cost, calc_video_cost(5.0, video_provider))
+        video_cost = add_costs(
+            video_cost,
+            calc_video_cost(5.0, video_provider, resolution=video_resolution),
+        )
 
     # TTS
     tts_cost = calc_tts_cost(

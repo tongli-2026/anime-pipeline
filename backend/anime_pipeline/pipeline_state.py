@@ -1,11 +1,20 @@
 # ==============================================================
-# Pipeline State — immutable state machine
+# Pipeline State — immutable transitions and checkpoint utilities
 #
-# Design:
-#   - All transition functions return a NEW PipelineState (no mutation)
-#   - model_copy(update={...}) is used for Pydantic v2 immutable updates
-#   - BudgetExceededError for budget overrun handling
-#   - serialize / deserialize use Pydantic's .model_dump_json() / .model_validate_json()
+# Pure helper functions for creating and transitioning `PipelineState` objects.
+# Responsibilities:
+#   - Create initial state snapshots (`create_initial_state`) used to start runs.
+#   - Provide pure, non-mutating transition functions that return new
+#     `PipelineState` instances (`transition_to`, `record_stage_complete`, etc.).
+#   - Manage checkpoints: enqueue, resolve, and persist checkpoint queue entries.
+#   - Attach costs, enforce budget checks, and surface `BudgetExceededError`
+#     when hard limits are exceeded.
+#
+# Conventions and maintainers notes:
+#   - Use Pydantic v2's `model_copy(update=...)` for immutable updates.
+#   - Functions should avoid side effects and never mutate their `state` arg.
+#   - State persistence uses `model_dump_json`/`model_validate_json`; keep field
+#     names stable or provide migration helpers for persisted states.
 # ==============================================================
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from .models import (
     LockedCharacter,
     PipelineState,
     PipelineStatus,
+    QualityPreset,
     SecondaryCharacter,
     StageRecord,
     Story,
@@ -42,6 +52,7 @@ def create_initial_state(user_input: UserInput, budget: BudgetConfig) -> Pipelin
         status="idle",
         current_stage="character_proposal",
         user_input=user_input,
+        quality_preset=user_input.quality_preset,
         characters=CharacterStore(),
         total_cost=zero_cost(),
         budget=budget,
@@ -218,7 +229,7 @@ def deserialize_state(json_str: str) -> PipelineState:
 
 def prioritize_scenes_by_budget(
     state: PipelineState,
-    quality_preset: str = "standard",
+    quality_preset: QualityPreset = "standard",
     video_provider: BillableVideoProvider = "seedance",
 ) -> PipelineState:
     """
@@ -241,6 +252,7 @@ def prioritize_scenes_by_budget(
         New PipelineState with optimized scene.needs_video assignments
     """
     from .cost_tracker import calc_image_cost, calc_video_cost
+    from .quality import get_quality_profile
 
     if not state.story or not state.story.scenes:
         return state
@@ -250,10 +262,12 @@ def prioritize_scenes_by_budget(
     # Estimate per-scene costs (simplified, actual costs vary by duration)
     # Video: ~5 second average clip
     avg_video_duration_seconds = 5.0
+    quality_profile = get_quality_profile(quality_preset)
     video_cost_per_scene = calc_video_cost(
         avg_video_duration_seconds,
         provider=video_provider,
-        quality="hd" if quality_preset == "high" else "standard",
+        quality=quality_profile.video_quality,
+        resolution=quality_profile.video_resolution,
     )
     image_cost_per_scene = calc_image_cost(
         count=1,

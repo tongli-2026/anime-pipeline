@@ -1,11 +1,21 @@
 # ==============================================================
-# Environment Configuration & Validation
+# Environment Configuration & Capability Detection
 #
-# Centralized env var management. All tools import keys from here
-# instead of calling os.environ.get() at module scope.
+# Centralized environment management used by all pipeline components.
+# This module provides:
+#   - `load_project_environment()` — locate and load a project `.env` file
+#     (called early in `main.py` so subsequent imports see populated keys).
+#   - `get_config()` — a cached, dataclass-based snapshot of all relevant
+#     API keys and runtime knobs. Call `get_config.cache_clear()` to force a
+#     refresh (useful in tests or after modifying env at runtime).
+#   - `detect_capabilities()` — lightweight capability discovery that reads
+#     `get_config()` and reports which providers/features (LLM, image, video,
+#     TTS, ffmpeg) are available based on configured keys and PATH checks.
 #
-# Keys are read lazily (on first access) so load_dotenv() in main.py
-# has time to populate the environment before any key is used.
+# Keys are intentionally read lazily (on first `get_config()` call) so that
+# `dotenv` can load from a discovered `.env` before any provider code runs.
+# Use the `PipelineCapabilities` struct returned by `detect_capabilities()`
+# to show friendly messages to users and to guard features at runtime.
 # ==============================================================
 
 from __future__ import annotations
@@ -13,6 +23,32 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+def load_project_environment() -> Path | None:
+    """Load the first project env file found across source and installed CLI layouts."""
+    explicit = os.environ.get("ANIME_PIPELINE_ENV_FILE")
+    candidates = [
+        Path(explicit).expanduser() if explicit else None,
+        Path.cwd() / ".env",
+        Path.cwd() / "backend" / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            load_dotenv(resolved, override=False)
+            return resolved
+    return None
 
 
 @dataclass(frozen=True)
@@ -25,9 +61,6 @@ class EnvConfig:
     # ── Image Generation ─────────────────────────────────────
     fal_key: str = ""
     replicate_api_token: str = ""
-    image_provider_default: str = "fal"
-    image_provider_keyframe: str = "openai"
-    image_provider_reference: str = "fal"
 
     # ── Video Generation ─────────────────────────────────────
     seedance_api_key: str = ""
@@ -36,6 +69,8 @@ class EnvConfig:
     runway_api_key: str = ""
 
     # ── TTS ──────────────────────────────────────────────────
+    # The OpenAI key is used for OpenAI TTS and (when the `openai` provider
+    # is selected) for OpenAI image generation as well.
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
     google_tts_api_key: str = ""
@@ -53,9 +88,6 @@ def _load_config() -> EnvConfig:
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         fal_key=os.environ.get("FAL_KEY", ""),
         replicate_api_token=os.environ.get("REPLICATE_API_TOKEN", ""),
-        image_provider_default=os.environ.get("IMAGE_PROVIDER_DEFAULT", "fal"),
-        image_provider_keyframe=os.environ.get("IMAGE_PROVIDER_KEYFRAME", "openai"),
-        image_provider_reference=os.environ.get("IMAGE_PROVIDER_REFERENCE", "fal"),
         seedance_api_key=os.environ.get("SEEDANCE_API_KEY", ""),
         kling_access_key=os.environ.get("KLING_ACCESS_KEY", ""),
         kling_secret_key=os.environ.get("KLING_SECRET_KEY", ""),
@@ -212,6 +244,13 @@ def print_capabilities_report() -> None:
 
     console.print()
     console.print(table)
+
+    # Note: OpenAI key may be used for both TTS and image generation
+    cfg = get_config()
+    if _is_configured(cfg.openai_api_key):
+        console.print(
+            "[dim]Note: OPENAI_API_KEY is used for OpenAI TTS and for OpenAI image generation when the 'openai' provider is selected.[/dim]"
+        )
 
     if cap.fully_operational:
         console.print(

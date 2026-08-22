@@ -1,20 +1,26 @@
-"""CLI for generating a single Shot with the anime-pipeline toolchain.
-
-This module provides a command-line entrypoint to create a single
-`Shot` using the project's generation backends (image, video, hybrid).
-Key responsibilities:
- - Build or load a `Shot` model (example or from JSON file).
- - Select the appropriate generator (image / video / hybrid) based on
-     the shot's `estimated_generation_mode`.
- - Run generation, collect output paths and cost metadata, print JSON
-     results and optionally write metadata to a file.
-
-Main functions:
- - `build_example_shot()` — construct a sample `Shot` for testing.
- - `load_shot_from_file()` — read and validate a shot JSON file.
- - `_run(args)` — async orchestration and generator invocation.
- - `build_parser()` / `main()` — CLI argument parsing and entrypoint.
-"""
+# ==============================================================
+# Shot CLI — single-shot generator and tester
+#
+# Lightweight command-line tool to generate a single `Shot` using the
+# project's image/video/hybrid generation backends. Intended for local
+# testing, debugging, and spot-generation of individual shots outside the
+# full pipeline orchestration.
+#
+# Responsibilities:
+#   - Build or load a `Shot` model (example or from JSON).
+#   - Select and run the appropriate generator based on
+#     `Shot.estimated_generation_mode` (image, video, hybrid).
+#   - Return generation artifacts (paths, keyframes) and cost metadata
+#     in a small JSON payload suitable for integration tests.
+#
+# Key entrypoints:
+#   - `build_example_shot()` — produce a two-frame example for quick tests.
+#   - `_run()` / `build_parser()` / `main()` — CLI wiring and argument parsing.
+#
+# Notes:
+#   - This module is for single-shot workflows and QA; use the orchestrator
+#     for full-story runs and cost estimation.
+# ==============================================================
 
 from __future__ import annotations
 
@@ -138,7 +144,6 @@ async def _run(args: argparse.Namespace) -> None:
     console.print(Panel("[bold magenta]🎞 Shot Hybrid Generator[/bold magenta]", expand=False))
     if args.show_capabilities:
         print_capabilities_report()
-        return
 
     if args.use_example:
         shot = build_example_shot()

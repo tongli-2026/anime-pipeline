@@ -1,0 +1,34 @@
+{
+  "concept": "Before You Judge: after his daughter's funeral, a grieving father is forced to experience the hidden chain of events behind a homeless man he once dismissed.",
+  "story_outline": "Open on a rainy cemetery beneath white flowers and black umbrellas. Seventeen-year-old Emma Hart's framed photograph rests beside her grave while her father, Daniel, stands apart from the mourners, dry-eyed and rigid. In Emma's bedroom, Daniel finds a folder of photographs, receipts, and handwritten observations titled Before You Judge. He reads one line aloud: 'Every person makes sense once you know enough.' A photograph shows a homeless man from a nearby intersection. Daniel goes there and watches the man hold a cardboard sign while commuters avoid him. The city sound abruptly disappears. Darkness. Daniel opens his eyes inside the man's life. In a rapid first-person sequence, he suffers a warehouse injury, reaches for prescription painkillers beside an unpaid medical bill, loses his job, and watches an eviction notice slide beneath his apartment door. He is suddenly standing at the intersection holding the same sign as strangers look away. Daniel snaps back to himself, shaken and crying. Among Emma's papers, he notices several old receipts for the same coffee and sandwich, dated weeks apart, followed by a brief memory of Emma quietly handing the man a paper bag. At dusk, Daniel returns carrying the same food. Instead of observing from across the street, he sits beside the man and asks, 'Can you tell me about her?' End on the two men beneath the bus shelter as rain and traffic fill the silence again. Keep dialogue sparse, tell the story through visible actions and match cuts, and preserve clear cause and effect. Do not rely on legible AI-generated writing to communicate essential information.",
+  "style": "grounded contemporary dramatic anime with subtle surrealism, restrained facial acting, realistic rainy city environments, soft gray daylight contrasted with warm convenience-store light, subjective first-person memory fragments, cinematic full-frame 16:9 composition, consistent character faces and clothing, no storyboard grids, comic panels, split screens, decorative text, or exaggerated fantasy effects",
+  "target_duration_seconds": 60,
+  "quality_preset": "standard",
+  "budget": {
+    "hard_limit_usd": 5.0,
+    "warn_at_usd": 3.5
+  },
+  "primary_characters": [
+    {
+      "name": "Daniel Hart",
+      "description": "45-year-old man with tired blue-gray eyes, short dark-brown hair graying at the temples, light stubble, and a lean face; he wears a charcoal wool overcoat over a black funeral suit, white shirt, and narrow black tie throughout the present-day story",
+      "personality": "Controlled, analytical, and emotionally guarded; he looks for simple causes because uncertainty frightens him",
+      "motivation": "He wants an explanation for Emma's death, but must learn that understanding a person requires compassion rather than a verdict",
+      "relationship_to_others": "Emma's grieving father; he initially judges the homeless man from a distance, then begins to see him as a person connected to his daughter"
+    },
+    {
+      "name": "Emma Hart",
+      "description": "17-year-old girl with shoulder-length chestnut hair, gentle green eyes, light freckles, and a mustard-yellow raincoat over a burgundy sweater; she appears in a framed portrait and one warm memory of delivering food",
+      "personality": "Quietly curious, observant, and compassionate without being sentimental",
+      "motivation": "She wants to understand the people whom others reduce to labels and records what she learns for a project called Before You Judge",
+      "relationship_to_others": "Daniel's daughter; her private acts of kindness challenge how little he understood both her and the people around them"
+    },
+    {
+      "name": "Marcus Reed",
+      "description": "50-year-old man with deep-set brown eyes, a close-cropped salt-and-pepper beard, and a weathered but dignified face; in the present he wears a faded olive parka, dark knit cap, gray hoodie, and worn gloves, while memory scenes show the same face in blue warehouse work clothes",
+      "personality": "Reserved, exhausted, and wary of pity, with traces of the patient and dependable worker he used to be",
+      "motivation": "He is trying to survive after injury, dependency, debt, job loss, and eviction narrowed his choices one step at a time",
+      "relationship_to_others": "Emma brought him food for months without judging him; Daniel initially sees only a stereotype before experiencing the history behind it"
+    }
+  ]
+}

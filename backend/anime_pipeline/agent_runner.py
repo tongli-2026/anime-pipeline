@@ -1,8 +1,23 @@
 # ==============================================================
-# Agent Runner — executes a single agent call against the LLM
+# Agent Runner — reliable single-call LLM wrapper
 #
-# Handles: cost tracking, retries with backoff, JSON extraction
-# Routes creative work to Anthropic and structured work to OpenAI.
+# Responsibilities:
+#   - Execute one `AgentDefinition` call against the appropriate LLM
+#     (creative vs structured) with sensible routing and fallbacks.
+#   - Track and return conservative cost estimates for the call.
+#   - Retry transient failures with exponential backoff (configurable attempts).
+#   - Robustly extract JSON payloads from LLM text responses (code fences,
+#     bare objects/arrays) and optionally validate them with a Pydantic model.
+#
+# Routing rules:
+#   - Creative/long-form `sonnet` calls go to Anthropic by default.
+#   - Structured `haiku` calls prefer OpenAI's structured JSON API when
+#     an OpenAI key is available; otherwise fall back to Claude/Anthropic.
+#
+# Notes:
+#   - This module deliberately exposes a small `LLMRouter` container so
+#     tests can inject mock clients. See `create_llm_router()` for the
+#     production client wiring.
 # ==============================================================
 
 from __future__ import annotations

@@ -1,15 +1,21 @@
-# ==============================================================
+# =====================================================================================
 # Tool: FFmpeg Video Composition
 #
-# Assembles scenes (images/videos) + TTS audio into a final MP4.
-# Uses ffmpeg-python (Python bindings for FFmpeg CLI).
+# Assemble scene media (images/videos) and generated TTS into a final MP4.
+# Uses the system `ffmpeg` CLI via subprocess (not the ffmpeg-python wrapper).
 #
-# Composition strategy:
-#   - Video scenes → used directly (trimmed to duration)
-#   - Image scenes → Ken Burns zoom-pan + fade transitions
-#   - TTS audio → aligned to scene timeline
-#   - Final output → H.264 + AAC, 1920×1080
-# ==============================================================
+# Key behaviors:
+#   - Video scenes: re-encode and trim to the target duration/profile
+#   - Image scenes: produce a Ken Burns zoom+pan with short fade in/out
+#   - Audio: collect per-line TTS files and align each to the timeline
+#            (per-line offsets computed from shot start + cumulative durations)
+#   - Concatenation: use FFmpeg concat demuxer for reliable joins
+#   - Output: H.264 + AAC with pipeline quality presets (resolution, fps, crf)
+#
+# Notes:
+#   - `ffmpeg`/`ffprobe` must be on PATH; composition is skipped if missing.
+#   - Composition itself has no pipeline generation cost (returns zero cost).
+# =====================================================================================
 
 from __future__ import annotations
 
@@ -17,10 +23,13 @@ import asyncio
 import logging
 import shutil
 import subprocess
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..cost_tracker import zero_cost
-from ..models import CostRecord, PipelineState, Scene, Shot
+from ..models import CostRecord, PipelineState, QualityPreset, Scene, Shot
+from ..quality import get_quality_profile
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +38,14 @@ OUTPUT_DIR = Path("./output")
 # Check if ffmpeg is installed
 FFMPEG_BIN = shutil.which("ffmpeg")
 FFPROBE_BIN = shutil.which("ffprobe")
+
+
+@dataclass(frozen=True)
+class ScheduledAudio:
+    file_path: str
+    start_time: float
+    duration_seconds: float
+    line_type: str
 
 
 async def _get_media_duration(file_path: str) -> float:
@@ -72,10 +89,208 @@ async def _has_audio_stream(file_path: str) -> bool:
         return False
 
 
+def _get_media_duration_sync(file_path: str) -> float:
+    """Get duration from ffprobe in the blocking FFmpeg composition path."""
+    if not FFPROBE_BIN:
+        return 0.0
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_BIN, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                file_path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(result.stdout.strip()) if result.stdout.strip() else 0.0
+    except Exception:
+        return 0.0
+
+
 def _is_valid_media(file_path: str) -> bool:
     """Check if a file exists and is non-empty (i.e. not a stub placeholder)."""
     p = Path(file_path)
     return p.exists() and p.stat().st_size > 100
+
+
+def _safe_audio_key(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+
+
+def _find_tts_audio(
+    audio_dir: Path,
+    *,
+    line_id: str,
+    character_id: str | None,
+) -> Path | None:
+    if line_id:
+        matching = sorted(
+            audio_dir.glob(f"line_{_safe_audio_key(line_id)}_*.mp3"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for audio_path in matching:
+            if audio_path.exists() and audio_path.stat().st_size > 100:
+                return audio_path
+
+    # Backward compatibility for older generated audio. New files use line_id.
+    if character_id:
+        matching = sorted(
+            audio_dir.glob(f"line_{character_id}_*.mp3"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for audio_path in matching:
+            if audio_path.exists() and audio_path.stat().st_size > 100:
+                return audio_path
+    return None
+
+
+def _audio_line_id(line: object) -> str:
+    return str(getattr(line, "id", "") or "")
+
+
+def _audio_character_id(line: object) -> str | None:
+    value = getattr(line, "character_id", None)
+    return str(value) if value else None
+
+
+def _line_type(line: object, fallback: str) -> str:
+    return str(getattr(line, "type", fallback) or fallback)
+
+
+def _is_spoken_tts_cue(line: object) -> bool:
+    line_type = _line_type(line, "")
+    text = str(getattr(line, "text", "") or "").strip()
+    if line_type not in {"ambient", "narration"}:
+        return True
+    if not text:
+        return False
+    if line_type == "narration":
+        return len(text.split()) <= 18
+    lower = text.lower()
+    descriptive_terms = (
+        "layered",
+        "fragments",
+        "density",
+        "texture",
+        "ambience",
+        "hiss",
+        "wind",
+        "rush",
+        "scrape",
+        "silence",
+        "offscreen",
+        "overlapping",
+        "whisper-bed",
+        "thought layer",
+    )
+    if any(term in lower for term in descriptive_terms) and not any(
+        quote in text for quote in ("'", '"')
+    ):
+        return False
+    return len(text.split()) <= 8
+
+
+def _schedule_line(
+    scheduled: list[ScheduledAudio],
+    audio_path: Path,
+    *,
+    unit_start: float,
+    unit_end: float,
+    cursor: float,
+    line_type: str,
+    max_duration: float | None = None,
+) -> float:
+    natural_duration = _get_media_duration_sync(str(audio_path))
+    if natural_duration <= 0:
+        natural_duration = 0.5
+    available = max(0.25, unit_end - cursor)
+    duration = min(natural_duration, available)
+    if max_duration is not None:
+        duration = min(duration, max_duration)
+    start = min(max(cursor, unit_start), max(unit_start, unit_end - duration))
+    scheduled.append(
+        ScheduledAudio(
+            file_path=str(audio_path),
+            start_time=start,
+            duration_seconds=duration,
+            line_type=line_type,
+        )
+    )
+    return min(unit_end, start + duration + 0.15)
+
+
+def _collect_tts_audio_files(
+    units: Sequence[Scene | Shot],
+    audio_dir: Path = Path("./output/audio"),
+) -> list[ScheduledAudio]:
+    audio_files: list[ScheduledAudio] = []
+    unit_start = 0.0
+
+    for unit in units:
+        unit_duration = max(0.1, float(unit.duration_seconds))
+        unit_end = unit_start + unit_duration
+        if not audio_dir.exists():
+            unit_start = unit_end
+            continue
+
+        narration_cues = [
+            cue
+            for cue in getattr(unit, "audio_cues", [])
+            if _line_type(cue, "") == "narration" and _is_spoken_tts_cue(cue)
+        ]
+        ambient_cues = [
+            cue
+            for cue in getattr(unit, "audio_cues", [])
+            if _line_type(cue, "") == "ambient" and _is_spoken_tts_cue(cue)
+        ]
+        dialogue_lines = list(getattr(unit, "dialogue", []))
+        inner_monologue = list(getattr(unit, "inner_monologue", []))
+
+        ambient_budget = unit_duration * 0.45 if dialogue_lines or inner_monologue else unit_duration * 0.75
+        ambient_cursor = unit_start
+        for cue in [*narration_cues, *ambient_cues]:
+            audio_path = _find_tts_audio(
+                audio_dir,
+                line_id=_audio_line_id(cue),
+                character_id=_audio_character_id(cue),
+            )
+            if not audio_path:
+                continue
+            max_duration = max(0.5, ambient_budget / max(1, len(narration_cues) + len(ambient_cues)))
+            ambient_cursor = _schedule_line(
+                audio_files,
+                audio_path,
+                unit_start=unit_start,
+                unit_end=unit_end,
+                cursor=ambient_cursor,
+                line_type=_line_type(cue, "ambient"),
+                max_duration=max_duration,
+            )
+
+        speech_cursor = unit_start
+        if narration_cues or ambient_cues:
+            speech_cursor = min(unit_end, unit_start + min(ambient_budget, unit_duration * 0.35))
+        for line in [*dialogue_lines, *inner_monologue]:
+            audio_path = _find_tts_audio(
+                audio_dir,
+                line_id=_audio_line_id(line),
+                character_id=_audio_character_id(line),
+            )
+            if not audio_path:
+                continue
+            speech_cursor = _schedule_line(
+                audio_files,
+                audio_path,
+                unit_start=unit_start,
+                unit_end=unit_end,
+                cursor=speech_cursor,
+                line_type=_line_type(line, "dialogue"),
+            )
+        unit_start = unit_end
+    return audio_files
 
 
 async def compose_video(state: PipelineState) -> tuple[str, CostRecord]:
@@ -118,7 +333,10 @@ async def compose_video(state: PipelineState) -> tuple[str, CostRecord]:
 
     try:
         output_path = await asyncio.to_thread(
-            _run_ffmpeg_compose, real_units, output_path
+            _run_ffmpeg_compose,
+            real_units,
+            output_path,
+            state.quality_preset,
         )
     except Exception as exc:
         logger.error("❌ FFmpeg composition failed: %s", exc)
@@ -128,7 +346,38 @@ async def compose_video(state: PipelineState) -> tuple[str, CostRecord]:
     return output_path, zero_cost()
 
 
+async def compose_shots(
+    shots: list[Shot],
+    output_path: str,
+    quality_preset: QualityPreset = "standard",
+) -> str:
+    """Compose already-generated shots without requiring a full PipelineState."""
+    if not FFMPEG_BIN:
+        raise RuntimeError("ffmpeg is not available")
+    valid_shots = [
+        shot
+        for shot in shots
+        if shot.output is not None and _is_valid_media(shot.output.file_path)
+    ]
+    if not valid_shots:
+        raise RuntimeError("No valid generated shot media to compose")
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return await asyncio.to_thread(
+        _run_ffmpeg_compose,
+        valid_shots,
+        str(destination),
+        quality_preset,
+    )
+
+
 def _collect_composition_units(state: PipelineState) -> list[Scene | Shot]:
+    if state.generation_units:
+        return [
+            unit.shot
+            for unit in sorted(state.generation_units, key=lambda item: item.index)
+            if unit.status == "completed" and unit.shot.output is not None
+        ]
     if state.timeline_plan and state.shot_plan and state.shot_plan.shots:
         shots_by_id = {shot.id: shot for shot in state.shot_plan.shots}
         units: list[Scene | Shot] = []
@@ -143,8 +392,9 @@ def _collect_composition_units(state: PipelineState) -> list[Scene | Shot]:
 
 
 def _run_ffmpeg_compose(
-    units: list[Scene | Shot],
+    units: Sequence[Scene | Shot],
     output_path: str,
+    quality_preset: QualityPreset = "standard",
 ) -> str:
     """
     Blocking FFmpeg execution — intended to run via asyncio.to_thread.
@@ -159,6 +409,8 @@ def _run_ffmpeg_compose(
     if FFMPEG_BIN is None:
         raise RuntimeError("ffmpeg is not available")
     ffmpeg_bin = FFMPEG_BIN
+    profile = get_quality_profile(quality_preset)
+    target_size = f"{profile.width}:{profile.height}"
 
     work_dir = Path(tempfile.mkdtemp(prefix="anime_compose_"))
     concat_list_path = work_dir / "concat.txt"
@@ -180,10 +432,14 @@ def _run_ffmpeg_compose(
                     ffmpeg_bin, "-y",
                     "-i", output.file_path,
                     "-t", str(duration),
-                    "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-vf", (
+                        f"scale={target_size}:force_original_aspect_ratio=decrease,"
+                        f"pad={target_size}:(ow-iw)/2:(oh-ih)/2"
+                    ),
+                    "-c:v", "libx264", "-preset", profile.ffmpeg_preset,
+                    "-crf", str(profile.intermediate_crf),
                     "-an",  # strip audio; we'll add TTS later
-                    "-r", "24",
+                    "-r", str(profile.fps),
                     str(clip_path),
                 ]
                 logger.info("  Unit %d [video]: %s → %s", i, output.file_path, clip_path)
@@ -191,19 +447,22 @@ def _run_ffmpeg_compose(
             elif output.type == "image" and _is_valid_media(output.file_path):
                 # Image scene: Ken Burns zoom-pan effect
                 # zoompan: slowly zoom from 1.0 to 1.15 over duration
-                fps = 24
+                fps = profile.fps
                 total_frames = int(duration * fps)
                 cmd = [
                     ffmpeg_bin, "-y",
                     "-loop", "1",
                     "-i", output.file_path,
                     "-vf", (
-                        f"scale=2048:-1,"
-                        f"zoompan=z='min(zoom+0.0005,1.15)':d={total_frames}:s=1920x1080:fps={fps},"
+                        f"scale={target_size}:force_original_aspect_ratio=increase,"
+                        f"crop={target_size},"
+                        f"zoompan=z='min(zoom+0.0005,1.15)':d={total_frames}:"
+                        f"s={profile.width}x{profile.height}:fps={fps},"
                         f"fade=t=in:st=0:d=0.5,fade=t=out:st={duration - 0.5}:d=0.5"
                     ),
                     "-t", str(duration),
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:v", "libx264", "-preset", profile.ffmpeg_preset,
+                    "-crf", str(profile.intermediate_crf),
                     "-pix_fmt", "yuv420p",
                     "-r", str(fps),
                     str(clip_path),
@@ -236,7 +495,8 @@ def _run_ffmpeg_compose(
             ffmpeg_bin, "-y",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list_path),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:v", "libx264", "-preset", profile.ffmpeg_preset,
+            "-crf", str(profile.final_crf),
             "-pix_fmt", "yuv420p",
             str(video_only_path),
         ]
@@ -246,29 +506,7 @@ def _run_ffmpeg_compose(
             return output_path
 
         # ── Step 4: Collect TTS audio files ─────────────────────
-        # Build timeline: figure out when each unit starts
-        audio_files: list[tuple[str, float]] = []
-        unit_start = 0.0
-        audio_dir = Path("./output/audio")
-
-        for unit in units:
-            dialogue_lines = list(getattr(unit, "dialogue", []))
-            inner_monologue = list(getattr(unit, "inner_monologue", []))
-            if (dialogue_lines or inner_monologue) and audio_dir.exists():
-                for line in dialogue_lines:
-                    # Match by character_id prefix in filename
-                    matching = sorted(audio_dir.glob(f"line_{line.character_id}_*.mp3"))
-                    for audio_path in matching:
-                        if audio_path.exists() and audio_path.stat().st_size > 100:
-                            audio_files.append((str(audio_path), unit_start))
-                            break
-                for cue in inner_monologue:
-                    matching = sorted(audio_dir.glob(f"line_{cue.character_id}_*.mp3"))
-                    for audio_path in matching:
-                        if audio_path.exists() and audio_path.stat().st_size > 100:
-                            audio_files.append((str(audio_path), unit_start))
-                            break
-            unit_start += unit.duration_seconds
+        audio_files = _collect_tts_audio_files(units)
 
         # ── Step 5: Mix audio into final video ──────────────────
         if audio_files:
@@ -276,12 +514,16 @@ def _run_ffmpeg_compose(
             inputs = ["-i", str(video_only_path)]
             filter_parts = []
 
-            for idx, (audio_file_path, start_time) in enumerate(audio_files):
-                inputs.extend(["-i", audio_file_path])
-                delay_ms = int(start_time * 1000)
-                # adelay: delay audio to align with scene
+            for idx, scheduled_audio in enumerate(audio_files):
+                inputs.extend(["-i", scheduled_audio.file_path])
+                delay_ms = int(scheduled_audio.start_time * 1000)
+                trim_duration = max(0.25, scheduled_audio.duration_seconds)
+                # atrim keeps long ambience/voiceover from spilling into later shots.
                 filter_parts.append(
-                    f"[{idx + 1}:a]adelay={delay_ms}|{delay_ms},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=mono[a{idx}]"
+                    f"[{idx + 1}:a]atrim=duration={trim_duration:.3f},"
+                    f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms},"
+                    "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=mono"
+                    f"[a{idx}]"
                 )
 
             # Mix all delayed audio streams
@@ -300,7 +542,6 @@ def _run_ffmpeg_compose(
                 "-map", "[aout]",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
                 output_path,
             ]
             result = subprocess.run(mix_cmd, capture_output=True, text=True, timeout=300)

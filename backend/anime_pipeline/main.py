@@ -1,36 +1,61 @@
-# ==============================================================
-# Main Entry Point
+# ===============================================================================================
+# CLI entrypoint to run or resume the anime generation pipeline.
 #
-# Usage:
+# Supported CLI options and choices:
+# - `--auto`: run non-interactively with sensible defaults.
+# - `--input-file <path>`: path to a `UserInput` JSON file to drive a run.
+# - `--state-file <path>`: path to a saved `PipelineState` JSON file to resume.
+# - `--quality-preset <draft|standard|high>`: end-to-end output quality.
+#
+# Interactive choices (when not using `--auto`):
+# - Output quality: `draft`, `standard`, `high`
+# - Budget modes: `budget`, `balanced`, `quality`
+# - Video providers: `auto`, `seedance`, `kling`, `runway`
+# - TTS providers: `auto`, `google`, `openai`, `elevenlabs`
+#
+# Usage examples:
 #   cd /Users/tong/AIProjects/anime-pipeline/backend
-#   .venv/bin/python -m anime_pipeline.main --auto --input-file input/story_request.example.json
-
-# ==============================================================
+#   .venv/bin/anime-pipeline --auto \
+#     --input-file input/story_request.example.json \
+#     --quality-preset standard
+#
+#   .venv/bin/anime-pipeline \
+#     --input-file input/story_request.cinematic-action.json
+# 
+#   Resume from a saved state:
+#     .venv/bin/anime-pipeline --state-file output/state_<run_id>.json --auto
+#
+# Developer module entrypoint:
+#   .venv/bin/python -m anime_pipeline.main --auto \
+#     --input-file input/story_request.example.json \
+#     --quality-preset standard
+# ===============================================================================================
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 from pathlib import Path
+from typing import cast
 
-from dotenv import load_dotenv
+from .checkpoint_system import AutoResolver, CLIResolver
+from .env import get_config, load_project_environment, print_capabilities_report
+from .models import PipelineState, PrimaryCharacterInput, QualityPreset, UserInput
+from .pipeline_orchestrator import PipelineOptions, run_from_state, run_pipeline
+from .pipeline_state import deserialize_state, serialize_state
 
-# Load .env from backend/ directory
-load_dotenv(Path(__file__).parent.parent / ".env")
-
-# Ensure env config is read AFTER dotenv loads
-from .env import get_config, print_capabilities_report  # noqa: E402
-
-get_config.cache_clear()  # re-read env after load_dotenv
-
-from .checkpoint_system import AutoResolver, CLIResolver  # noqa: E402
-from .cost_tracker import estimate_pipeline_cost, format_cost_summary  # noqa: E402
-from .models import PipelineState, PrimaryCharacterInput, UserInput  # noqa: E402
-from .pipeline_orchestrator import PipelineOptions, run_from_state, run_pipeline  # noqa: E402
-from .pipeline_state import deserialize_state, serialize_state  # noqa: E402
+load_project_environment()
+get_config.cache_clear()
 
 
 def _build_default_user_input() -> UserInput:
+    """Return a sensible default `UserInput` used when no input file is provided.
+
+    This example input is intended for quick local testing and demos. It
+    populates `concept`, `story_outline`, `style`, `target_duration_seconds`,
+    and two `primary_characters` entries so the pipeline can run without
+    external input.
+    """
     return UserInput(
         concept="A high school girl who can hear thoughts falls for the only boy she cannot read.",
         story_outline="""
@@ -67,6 +92,14 @@ def _build_default_user_input() -> UserInput:
 
 
 def _load_user_input(input_file: str | None) -> UserInput:
+    """Load `UserInput` from `input_file` JSON or return the default input.
+
+    Args:
+        input_file: Path to a JSON file containing a serialized `UserInput`.
+
+    Returns:
+        A validated `UserInput` instance.
+    """
     if not input_file:
         return _build_default_user_input()
     raw = Path(input_file).read_text()
@@ -74,14 +107,30 @@ def _load_user_input(input_file: str | None) -> UserInput:
 
 
 def _load_state(state_file: str) -> PipelineState:
+    """Deserialize a saved `PipelineState` from a JSON state file.
+
+    This is used to resume a previously interrupted or persisted pipeline run.
+    """
     raw = Path(state_file).read_text()
     return deserialize_state(raw)
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line argument parser for the pipeline CLI.
+
+    The parser supports:
+    - `--auto`: run non-interactively with defaults
+    - `--input-file`: path to a `UserInput` JSON file
+    - `--state-file`: path to a saved `PipelineState` JSON file to resume
+    - `--quality-preset <draft|standard|high>`: end-to-end output quality
+    """
     parser = argparse.ArgumentParser(
         prog="anime-pipeline",
-        description="Run the anime generation pipeline from a reusable JSON input file.",
+        description=(
+            "Run the anime generation pipeline from a reusable JSON input file. "
+            "Use --quality-preset draft, standard, or high to control image, "
+            "video, and final encoding quality consistently."
+        ),
     )
     parser.add_argument(
         "--auto",
@@ -94,12 +143,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "--state-file",
         help="Path to a saved PipelineState JSON file to resume.",
     )
+    parser.add_argument(
+        "--quality-preset",
+        choices=["draft", "standard", "high"],
+        help="Output quality used consistently for images, video, and final encoding.",
+    )
     return parser
 
 
 async def _run() -> None:
     from rich.console import Console
     from rich.panel import Panel
+
+    """Main asynchronous runtime for the CLI.
+
+    Flow:
+    1. Parse CLI arguments and show a capabilities report.
+    2. Load `UserInput` or a saved `PipelineState` when resuming.
+    3. Print a pre-flight cost estimate.
+    4. Choose budget, video, and tts providers (interactive or `--auto`).
+    5. Create a `Resolver` (interactive checkpoints) and `PipelineOptions`.
+    6. Call `run_pipeline` or `run_from_state` and persist the final state.
+    """
 
     args = _build_parser().parse_args()
     console = Console()
@@ -114,21 +179,36 @@ async def _run() -> None:
     auto_mode = args.auto
     state = _load_state(args.state_file) if args.state_file else None
     user_input = state.user_input if state else _load_user_input(args.input_file)
+    quality_default: QualityPreset = (
+        args.quality_preset
+        or (state.quality_preset if state else user_input.quality_preset)
+    )
 
-    # Pre-flight cost estimate
-    console.print("\n[bold]📊 Pre-flight cost estimate:[/bold]")
-    estimate = estimate_pipeline_cost(12, 3, 2, 200, "standard")
-    console.print(format_cost_summary(estimate))
-    console.print()
+    # NOTE: Detailed, authoritative cost estimates are shown by the
+    # pipeline orchestrator when the run actually starts. Avoid showing a
+    # second, possibly inconsistent quick estimate here.
 
     # Budget mode selection
     from rich.prompt import Prompt
     if auto_mode:
+        quality_preset = quality_default
         budget_mode = "balanced"
         video_provider = "auto"
         tts_provider = "auto"
-        console.print("[dim]--auto mode: using defaults (balanced / auto / auto)[/dim]")
+        console.print(
+            f"[dim]--auto mode: using {quality_preset} quality "
+            "(balanced / auto / auto)[/dim]"
+        )
     else:
+        quality_preset = cast(
+            QualityPreset,
+            args.quality_preset
+            or Prompt.ask(
+                "[bold]Output quality[/bold]",
+                choices=["draft", "standard", "high"],
+                default=quality_default,
+            ),
+        )
         budget_mode = Prompt.ask(
             "[bold]Budget mode[/bold]",
             choices=["budget", "balanced", "quality"],
@@ -151,7 +231,24 @@ async def _run() -> None:
             show_choices=True,
         )
 
+    if state and any(unit.status == "completed" for unit in state.generation_units):
+        if quality_preset != state.quality_preset:
+            raise ValueError(
+                "Cannot change quality while resuming a state with completed generation units. "
+                f"Continue with {state.quality_preset!r} or start a new pipeline run."
+            )
+
+    user_input = user_input.model_copy(update={"quality_preset": quality_preset})
+    if state:
+        state = state.model_copy(
+            update={
+                "user_input": user_input,
+                "quality_preset": quality_preset,
+            }
+        )
+
     console.print("\n✓ Configuration:")
+    console.print(f"  Output quality: {quality_preset}")
     console.print(f"  Budget mode: {budget_mode}")
     console.print(f"  Video provider: {video_provider}")
     console.print(f"  TTS provider: {tts_provider}\n")
@@ -161,7 +258,7 @@ async def _run() -> None:
 
     # Run the pipeline
     options = PipelineOptions(
-        quality_preset="standard",
+        quality_preset=quality_preset,
         skip_scene_review=False,
         skip_secondary_char_review=False,
         dry_run=False,
@@ -183,7 +280,12 @@ async def _run() -> None:
 
 
 def main() -> None:
-    """Entry point registered in pyproject.toml [project.scripts]."""
+    """Synchronous entrypoint invoked by `python -m anime_pipeline.main`.
+
+    This simply runs the async `_run()` coroutine using `asyncio.run` and is
+    registered as the console script in `pyproject.toml` so users can run the
+    pipeline with `python -m anime_pipeline.main` or the generated script.
+    """
     asyncio.run(_run())
 
 

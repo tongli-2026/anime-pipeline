@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+# ==============================================================
+# Prompt Builders — assemble prompts for LLM-driven stages
+#
+# Helpers that construct the LLM prompt payloads used throughout the
+# pipeline (character proposal, story generation, scene breakdown, shot
+# planning, scene prompt builder, and TTS script assembly). These helpers
+# serialize relevant portions of the `PipelineState` and `UserInput` into
+# deterministic, reviewer-friendly JSON blocks and human-readable guidance
+# so the LLM receives a complete, reproducible context window.
+#
+# Conventions:
+#  - Keep prompt builders pure and side-effect free; they should only read
+#    state and return strings suitable for the LLM.
+#  - Prefer explicit field lists (IDs, prompt_base, durations) so outputs
+#    can be modeled and validated by downstream normalizers.
+#  - Keep batch/size tuning constants close to the top of the module.
+# ==============================================================
 import json
 from typing import Any
 
@@ -16,6 +33,8 @@ from .models import (
     Story,
     UserInput,
 )
+from .normalizers import _normalize_dialogue_items, _normalize_inner_monologue_items
+from .voice_profiles import ensure_character_voice_profiles, resolve_voice_profile_for_line
 
 SCENE_PROMPT_BATCH_SIZE = 8
 SCENE_PROMPT_TARGET_CHARS = 32000
@@ -303,6 +322,7 @@ def _serialize_scene_prompt_builder_shot(shot: Shot) -> dict[str, Any]:
         "shot_scale": shot.shot_scale,
         "camera_angle": shot.camera_angle,
         "camera_motion": shot.camera_motion,
+        "continuity_mode": shot.continuity_mode,
         "visual_intent": shot.visual_intent,
         "action_description": shot.action_description,
         "estimated_generation_mode": shot.estimated_generation_mode,
@@ -397,55 +417,159 @@ def _build_scene_prompt_builder_input_for_shots(state: PipelineState, shots: lis
     )
 
 
-def _build_tts_script_input(state: PipelineState) -> str:
+def _collect_tts_script_lines(state: PipelineState) -> list[dict[str, Any]]:
     tts_lines: list[dict[str, Any]] = []
+    voice_profiles = ensure_character_voice_profiles(state)
+    character_ids: set[str] = {character.id for character in state.characters.locked}
+    character_ids.update(character.id for character in state.characters.secondary)
+    name_to_id: dict[str, str] = {
+        character.name.strip().lower(): character.id
+        for character in state.characters.locked
+    }
+    name_to_id.update(
+        {
+            character.name.strip().lower(): character.id
+            for character in state.characters.secondary
+        }
+    )
+
+    def _resolve_id(hint: str) -> str:
+        normalized = str(hint).strip()
+        if normalized in character_ids:
+            return normalized
+        name_key = normalized.lower()
+        if name_key in name_to_id:
+            return name_to_id[name_key]
+        for name, character_id in name_to_id.items():
+            if name_key and (name_key in name or name.startswith(name_key)):
+                return character_id
+        return ""
+
+    scene_by_id = {
+        scene.id: scene
+        for scene in (state.story.scenes if state.story else [])
+    }
 
     if state.shot_plan and state.shot_plan.shots:
         for shot in state.shot_plan.shots:
+            shot_character_ids = [
+                character.character_id
+                for character in shot.characters
+                if character.character_id
+            ]
+            scene = scene_by_id.get(shot.scene_id or "")
+            scene_character_ids = (
+                [slot.character_id for slot in scene.characters if slot.character_id]
+                if scene is not None
+                else []
+            )
+            dialogue_fallback = shot_character_ids[0] if len(shot_character_ids) == 1 else ""
+            if not dialogue_fallback and len(scene_character_ids) == 1:
+                dialogue_fallback = scene_character_ids[0]
+            pov_character_id = (
+                scene_character_ids[0]
+                if scene_character_ids
+                else shot_character_ids[0] if shot_character_ids else ""
+            )
             for line in shot.dialogue:
+                normalized = _normalize_dialogue_items(
+                    [line.model_dump()],
+                    _resolve_id,
+                    dialogue_fallback,
+                )[0]
                 tts_lines.append(
                     {
-                        **line.model_dump(),
+                        **normalized,
+                        "line_id": line.id,
                         "scene_id": shot.scene_id,
                         "shot_id": shot.id,
                         "type": "dialogue",
+                        "voice_profile": resolve_voice_profile_for_line(
+                            normalized["character_id"],
+                            voice_profiles,
+                        ),
                     }
                 )
             for cue in shot.inner_monologue:
+                normalized = _normalize_inner_monologue_items(
+                    [cue.model_dump()],
+                    _resolve_id,
+                    pov_character_id,
+                )[0]
                 tts_lines.append(
                     {
-                        "character_id": cue.character_id or "",
-                        "text": cue.text,
-                        "emotion": cue.emotion or "reflective",
+                        "line_id": cue.id,
+                        "character_id": normalized["character_id"],
+                        "text": normalized["text"],
+                        "emotion": normalized["emotion"],
                         "scene_id": shot.scene_id,
                         "shot_id": shot.id,
                         "type": "inner_monologue",
+                        "voice_profile": resolve_voice_profile_for_line(
+                            normalized["character_id"],
+                            voice_profiles,
+                        ),
                     }
                 )
     else:
         for scene in state.story.scenes if state.story else []:
+            scene_character_ids = [
+                slot.character_id for slot in scene.characters if slot.character_id
+            ]
+            dialogue_fallback = scene_character_ids[0] if len(scene_character_ids) == 1 else ""
+            pov_character_id = scene_character_ids[0] if scene_character_ids else ""
             for line in scene.dialogue:
+                normalized = _normalize_dialogue_items(
+                    [line.model_dump()],
+                    _resolve_id,
+                    dialogue_fallback,
+                )[0]
                 tts_lines.append(
                     {
-                        **line.model_dump(),
+                        **normalized,
+                        "line_id": line.id,
                         "scene_id": scene.id,
                         "type": "dialogue",
+                        "voice_profile": resolve_voice_profile_for_line(
+                            normalized["character_id"],
+                            voice_profiles,
+                        ),
                     }
                 )
             for cue in scene.inner_monologue:
+                normalized = _normalize_inner_monologue_items(
+                    [cue.model_dump()],
+                    _resolve_id,
+                    pov_character_id,
+                )[0]
                 tts_lines.append(
                     {
-                        "character_id": cue.character_id or "",
-                        "text": cue.text,
-                        "emotion": cue.emotion or "reflective",
+                        "line_id": cue.id,
+                        "character_id": normalized["character_id"],
+                        "text": normalized["text"],
+                        "emotion": normalized["emotion"],
                         "scene_id": scene.id,
                         "type": "inner_monologue",
+                        "voice_profile": resolve_voice_profile_for_line(
+                            normalized["character_id"],
+                            voice_profiles,
+                        ),
                     }
                 )
+    return tts_lines
+
+
+def _build_tts_script_input(state: PipelineState) -> str:
+    tts_lines = _collect_tts_script_lines(state)
+    voice_profiles = ensure_character_voice_profiles(state)
 
     return "\n".join(
         [
-            "Spoken lines and inner monologue lines to format for TTS:",
+            "Character voice profiles. Preserve each line's voice_profile as voice_hint.",
+            json.dumps(voice_profiles, ensure_ascii=False, indent=2),
+            "",
+            "Only spoken dialogue and inner monologue lines to format for TTS.",
+            "For each line, add delivery_instructions and speed based on character age, personality, emotion, volume, pace, and line type.",
             json.dumps(tts_lines, ensure_ascii=False, indent=2),
         ]
     )

@@ -1,24 +1,36 @@
 # ==============================================================
 # Human-in-the-Loop Checkpoint System
 #
-# Handles interactive pauses in the pipeline where user decisions are needed:
-#   - Character selection (required)
-#   - Scene review (optional, 30s auto-approve)
-#   - Secondary character approval (optional, 60s auto-approve)
-#   - Budget warnings (optional, 15s auto-continue)
+# Purpose:
+#   Provide a pluggable checkpoint/resolution layer for the pipeline where
+#   human decisions or automated fallbacks are required before continuing.
 #
-# Implementation notes:
-#   - CheckpointResolver is an abstract base class (ABC)
-#   - CLIResolver uses `questionary` for terminal prompts
-#   - Auto-resolve uses asyncio.wait_for + timeout for optional checkpoints
-#   - `rich` provides colored output and formatted panels
+# Responsibilities:
+#   - Present structured choices to the user (CLI / Web / API) or auto-resolve
+#     them after a configurable timeout for non-critical checkpoints.
+#   - Expose a minimal abstract `CheckpointResolver` interface so production
+#     integrations (CLI, WebSocket, REST) and test mocks can be swapped in.
+#   - Return typed resolution objects used by the orchestrator to advance or
+#     modify generation behavior (character selection, scene approval,
+#     secondary character acceptance, budget actions).
+#
+# Key behaviors:
+#   - `CLIResolver` implements interactive terminal prompts (uses `questionary`).
+#   - Optional checkpoints are auto-resolved using `asyncio.wait_for` and
+#     sensible defaults when the user does not respond in time.
+#   - All UI output uses `rich` for readable panels and highlighting.
+#
+# Notes:
+#   - Designed for testability: provide `MockResolver` implementations in tests.
+#   - Timeouts and auto-approve policies are intentionally conservative to
+#     avoid blocking long-running CI or unattended runs.
 # ==============================================================
 
 from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from rich.console import Console
 from rich.panel import Panel
@@ -215,7 +227,7 @@ class CLIResolver(CheckpointResolver):
             expand=False,
         ))
 
-        action: str = await asyncio.to_thread(
+        raw_action: str = await asyncio.to_thread(
             questionary.select(
                 "What would you like to do?",
                 choices=[
@@ -226,7 +238,10 @@ class CLIResolver(CheckpointResolver):
             ).ask
         )
 
-        if action not in ("continue", "reduce_quality", "abort"):
+        action: Literal["continue", "reduce_quality", "abort"]
+        if raw_action in ("continue", "reduce_quality", "abort"):
+            action = cast(Literal["continue", "reduce_quality", "abort"], raw_action)
+        else:
             action = "continue"
         return BudgetWarningResolution(action=action)
 

@@ -1,9 +1,195 @@
+# ==============================================================
+# Normalizers — canonicalize LLM agent outputs into pipeline shapes
+#
+# Convert loosely-structured agent outputs into well-formed pipeline models
+# (Scene, Shot, TimelinePlan, etc.). Responsibilities:
+#   - Sanitize and normalize scene/shot dictionaries produced by LLM agents.
+#   - Resolve character name → id mappings and populate CharacterState slots.
+#   - Normalize dialogue and inner-monologue items into typed payloads suitable
+#     for TTS generation and timeline composition.
+#   - Decide generation mode heuristically (`image` / `video` / `hybrid`) and
+#     ensure hybrid shots include stable keyframe prompts for continuity.
+#   - Provide tolerant parsing helpers that accept legacy stringified dicts,
+#     simple strings, or structured JSON-like payloads from LLM outputs.
+#
+# Key helpers:
+#   - `normalize_scene(raw, char_name_to_id)` — sanitize scene dicts and
+#     extract normalized `dialogue`, `inner_monologue`, and `characters` slots.
+#   - `normalize_shot(raw, scene_lookup, char_name_to_id)` — normalize shot
+#     properties, literal values, and character anchors.
+#   - `decide_generation_mode(out, scene)` — heuristic to pick `image`/`video`/`hybrid`.
+#   - `ensure_hybrid_keyframes(out, scene)` — fill missing keyframe prompts for
+#     hybrid shots.
+#   - `build_timeline_plan_from_shots(shots, story_id)` — build a `TimelinePlan`
+#     from a list of `Shot` objects.
+#
+# Notes for maintainers:
+#   - Heuristics (regexes, duration thresholds) live in this module — tweak with care.
+#   - Keep normalization idempotent: calling `normalize_*` twice should be safe.
+# ==============================================================
+
 from __future__ import annotations
 
+import ast
 import re
+from collections.abc import Callable
 from typing import Any
 
 from .models import Scene, Shot, TimelinePlan, TimelineSegment
+
+
+def _listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _mapping_from_value(value: Any) -> dict[str, Any] | None:
+    """Return dict-shaped agent output, including legacy stringified dictionaries."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip().startswith("{"):
+        return None
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_audio_cue_type(value: Any) -> str:
+    cue_type = str(value or "ambient").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "narrator": "narration",
+        "voiceover": "narration",
+        "voice_over": "narration",
+        "vo": "narration",
+        "thought": "inner_monologue",
+        "thoughts": "inner_monologue",
+        "inner_voice": "inner_monologue",
+        "whisper": "ambient",
+        "whispers": "ambient",
+        "background": "ambient",
+        "background_voice": "ambient",
+        "background_voices": "ambient",
+        "sound_effect": "sfx",
+        "sound_effects": "sfx",
+        "sound": "sfx",
+        "silence_only": "silence",
+    }
+    normalized = aliases.get(cue_type, cue_type)
+    allowed = {"dialogue", "inner_monologue", "narration", "sfx", "music", "ambient", "silence"}
+    return normalized if normalized in allowed else "ambient"
+
+
+def _normalize_dialogue_items(
+    value: Any,
+    resolve_id: Callable[[str], str],
+    fallback_character_id: str = "",
+) -> list[dict[str, Any]]:
+    dialogue_pattern = re.compile(
+        r"^([A-Za-z][A-Za-z\s]+?)"
+        r"(?:\s*\([^)]*\))?"
+        r"\s*[:\-–]\s*"
+        r"['\"]?(.*?)['\"]?$",
+        re.DOTALL,
+    )
+    normalized: list[dict[str, Any]] = []
+    for item in _listify(value):
+        payload = _mapping_from_value(item)
+        if payload is not None:
+            explicit_id = payload.get("character_id") or payload.get("speaker_id") or ""
+            cid = resolve_id(str(explicit_id)) or str(explicit_id)
+            speaker = payload.get("speaker") or payload.get("name") or ""
+            if not cid and speaker:
+                cid = resolve_id(str(speaker))
+            raw_text = payload.get("text") or payload.get("content") or payload.get("line") or ""
+            emotion = payload.get("emotion", "neutral")
+            nested_payload = _mapping_from_value(raw_text)
+            if nested_payload is not None:
+                nested_id = (
+                    nested_payload.get("character_id")
+                    or nested_payload.get("speaker_id")
+                    or ""
+                )
+                cid = cid or resolve_id(str(nested_id)) or str(nested_id)
+                nested_speaker = nested_payload.get("speaker") or nested_payload.get("name") or ""
+                if not cid and nested_speaker:
+                    cid = resolve_id(str(nested_speaker))
+                raw_text = (
+                    nested_payload.get("text")
+                    or nested_payload.get("content")
+                    or nested_payload.get("line")
+                    or ""
+                )
+                emotion = nested_payload.get("emotion", emotion)
+        elif isinstance(item, str):
+            raw_text = item
+            cid = ""
+            emotion = "neutral"
+        else:
+            continue
+
+        clean_text = str(raw_text).strip()
+        match = dialogue_pattern.match(clean_text)
+        if match:
+            speaker_name = match.group(1).strip()
+            clean_text = match.group(2).strip().strip("'\"") or clean_text
+            cid = resolve_id(speaker_name) or cid
+
+        normalized.append(
+            {
+                "character_id": cid or fallback_character_id,
+                "text": clean_text,
+                "emotion": emotion,
+            }
+        )
+    return normalized
+
+
+def _normalize_inner_monologue_items(
+    value: Any,
+    resolve_id: Callable[[str], str],
+    fallback_character_id: str = "",
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(_listify(value)):
+        payload = _mapping_from_value(item)
+        if payload is not None:
+            explicit_id = payload.get("character_id") or payload.get("speaker_id") or ""
+            cid = resolve_id(str(explicit_id)) or str(explicit_id)
+            speaker = payload.get("speaker") or payload.get("name") or ""
+            if not cid and speaker:
+                cid = resolve_id(str(speaker))
+            text = payload.get("text") or payload.get("content") or payload.get("line") or ""
+            emotion = payload.get("emotion") or "reflective"
+            priority = payload.get("priority", 0.6)
+            start_offset_ms = payload.get("start_offset_ms", idx * 500)
+            duration_ms = payload.get("duration_ms")
+        elif isinstance(item, str):
+            cid = ""
+            text = item
+            emotion = "reflective"
+            priority = 0.6
+            start_offset_ms = idx * 500
+            duration_ms = None
+        else:
+            continue
+
+        normalized.append(
+            {
+                "type": "inner_monologue",
+                "text": str(text).strip(),
+                "character_id": cid or fallback_character_id,
+                "emotion": emotion,
+                "priority": priority,
+                "start_offset_ms": start_offset_ms,
+                "duration_ms": duration_ms,
+            }
+        )
+    return normalized
 
 
 def normalize_scene(
@@ -19,6 +205,8 @@ def normalize_scene(
 
     def _resolve_id(name_hint: str) -> str:
         name_lower = name_hint.lower().strip()
+        if name_hint in name_map.values():
+            return name_hint
         if name_lower in name_map:
             return name_map[name_lower]
         for key, uid in name_map.items():
@@ -55,76 +243,23 @@ def normalize_scene(
         normalized_chars.append(slot)
     out["characters"] = normalized_chars
 
-    dialogue_pattern = re.compile(
-        r"^([A-Za-z][A-Za-z\s]+?)"
-        r"(?:\s*\([^)]*\))?"
-        r"\s*[:\-–]\s*"
-        r"['\"]?(.*?)['\"]?$",
-        re.DOTALL,
+    scene_character_ids = [
+        str(slot.get("character_id"))
+        for slot in normalized_chars
+        if slot.get("character_id")
+    ]
+    dialogue_fallback = scene_character_ids[0] if len(scene_character_ids) == 1 else ""
+    pov_character_id = scene_character_ids[0] if scene_character_ids else ""
+    out["dialogue"] = _normalize_dialogue_items(
+        raw.get("dialogue", []),
+        _resolve_id,
+        dialogue_fallback,
     )
-    normalized_dialogue = []
-    for d in raw.get("dialogue", []):
-        if isinstance(d, str):
-            raw_text = d
-            cid = ""
-            emotion = "neutral"
-        elif isinstance(d, dict):
-            raw_text = d.get("text", str(d))
-            cid = d.get("character_id", "")
-            emotion = d.get("emotion", "neutral")
-        else:
-            continue
-
-        match = dialogue_pattern.match(raw_text.strip())
-        if match:
-            speaker_name = match.group(1).strip()
-            clean_text = match.group(2).strip().strip("'\"")
-            resolved_id = _resolve_id(speaker_name)
-            if resolved_id:
-                cid = resolved_id
-            if not clean_text:
-                clean_text = raw_text
-        else:
-            clean_text = raw_text
-
-        if not cid and isinstance(d, dict) and d.get("character_id"):
-            cid = _resolve_id(d["character_id"])
-
-        normalized_dialogue.append(
-            {
-                "character_id": cid,
-                "text": clean_text,
-                "emotion": emotion,
-            }
-        )
-    out["dialogue"] = normalized_dialogue
-
-    normalized_inner_monologue = []
-    for idx, cue in enumerate(raw.get("inner_monologue", [])):
-        if isinstance(cue, str):
-            normalized_inner_monologue.append(
-                {
-                    "type": "inner_monologue",
-                    "text": cue,
-                    "character_id": "",
-                    "emotion": "reflective",
-                    "priority": 0.6,
-                    "start_offset_ms": idx * 500,
-                }
-            )
-        elif isinstance(cue, dict):
-            normalized_inner_monologue.append(
-                {
-                    "type": "inner_monologue",
-                    "text": cue.get("text", ""),
-                    "character_id": _resolve_id(cue.get("character_id", "") or cue.get("name", "")),
-                    "emotion": cue.get("emotion"),
-                    "priority": cue.get("priority", 0.6),
-                    "start_offset_ms": cue.get("start_offset_ms", idx * 500),
-                    "duration_ms": cue.get("duration_ms"),
-                }
-            )
-    out["inner_monologue"] = normalized_inner_monologue
+    out["inner_monologue"] = _normalize_inner_monologue_items(
+        raw.get("inner_monologue", []),
+        _resolve_id,
+        pov_character_id,
+    )
 
     if "type" not in out:
         is_key = out.get("is_action_heavy", False) or out.get("priority_score", 0) >= 0.8
@@ -237,6 +372,7 @@ def normalize_shot(
     out.setdefault("shot_scale", "medium")
     out.setdefault("camera_angle", "eye_level")
     out.setdefault("camera_motion", "static")
+    out.setdefault("continuity_mode", "auto")
     out.setdefault("location", scene.location if scene else "unknown")
     out.setdefault("time_of_day", scene.time_of_day if scene else "day")
     out.setdefault("mood", scene.mood if scene else "neutral")
@@ -247,19 +383,14 @@ def normalize_shot(
         name_lower = str(name_hint).lower().strip()
         if not name_lower:
             return ""
+        if str(name_hint) in name_map.values():
+            return str(name_hint)
         if name_lower in name_map:
             return name_map[name_lower]
         for key, uid in name_map.items():
             if name_lower in key or key.startswith(name_lower):
                 return uid
         return ""
-
-    def _listify(value: Any) -> list[Any]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        return [value]
 
     def _normalize_literal(
         value: Any,
@@ -334,76 +465,34 @@ def normalize_shot(
         )
     out["characters"] = normalized_characters
 
-    dialogue_pattern = re.compile(
-        r"^([A-Za-z][A-Za-z\s]+?)"
-        r"(?:\s*\([^)]*\))?"
-        r"\s*[:\-–]\s*"
-        r"['\"]?(.*?)['\"]?$",
-        re.DOTALL,
+    shot_character_ids = [
+        str(slot.get("character_id"))
+        for slot in normalized_characters
+        if slot.get("character_id")
+    ]
+    scene_character_ids = (
+        [slot.character_id for slot in scene.characters if slot.character_id]
+        if scene is not None
+        else []
     )
-    normalized_dialogue = []
-    for d in _listify(out.get("dialogue", [])):
-        if isinstance(d, str):
-            raw_text = d
-            cid = ""
-            emotion = "neutral"
-        elif isinstance(d, dict):
-            raw_text = str(d.get("text", d.get("content", str(d))))
-            cid = d.get("character_id", "")
-            emotion = d.get("emotion", "neutral")
-        else:
-            continue
-
-        match = dialogue_pattern.match(str(raw_text).strip())
-        if match:
-            speaker_name = match.group(1).strip()
-            clean_text = match.group(2).strip().strip("'\"")
-            resolved_id = _resolve_id(speaker_name)
-            if resolved_id:
-                cid = resolved_id
-            if not clean_text:
-                clean_text = str(raw_text)
-        else:
-            clean_text = str(raw_text)
-
-        if not cid and isinstance(d, dict) and d.get("character_id"):
-            cid = _resolve_id(d["character_id"])
-
-        normalized_dialogue.append(
-            {
-                "character_id": cid,
-                "text": clean_text,
-                "emotion": emotion,
-            }
-        )
-    out["dialogue"] = normalized_dialogue
-
-    normalized_inner_monologue = []
-    for idx, cue in enumerate(_listify(out.get("inner_monologue", []))):
-        if isinstance(cue, str):
-            normalized_inner_monologue.append(
-                {
-                    "type": "inner_monologue",
-                    "text": cue,
-                    "character_id": "",
-                    "emotion": "reflective",
-                    "priority": 0.6,
-                    "start_offset_ms": idx * 500,
-                }
-            )
-        elif isinstance(cue, dict):
-            normalized_inner_monologue.append(
-                {
-                    "type": "inner_monologue",
-                    "text": cue.get("text", cue.get("content", "")),
-                    "character_id": _resolve_id(cue.get("character_id", "") or cue.get("name", "")),
-                    "emotion": cue.get("emotion"),
-                    "priority": cue.get("priority", 0.6),
-                    "start_offset_ms": cue.get("start_offset_ms", idx * 500),
-                    "duration_ms": cue.get("duration_ms"),
-                }
-            )
-    out["inner_monologue"] = normalized_inner_monologue
+    dialogue_fallback = shot_character_ids[0] if len(shot_character_ids) == 1 else ""
+    if not dialogue_fallback and len(scene_character_ids) == 1:
+        dialogue_fallback = scene_character_ids[0]
+    pov_character_id = (
+        scene_character_ids[0]
+        if scene_character_ids
+        else shot_character_ids[0] if shot_character_ids else ""
+    )
+    out["dialogue"] = _normalize_dialogue_items(
+        out.get("dialogue", []),
+        _resolve_id,
+        dialogue_fallback,
+    )
+    out["inner_monologue"] = _normalize_inner_monologue_items(
+        out.get("inner_monologue", []),
+        _resolve_id,
+        pov_character_id,
+    )
 
     normalized_audio_cues = []
     for idx, cue in enumerate(_listify(out.get("audio_cues", []))):
@@ -419,7 +508,7 @@ def normalize_shot(
         elif isinstance(cue, dict):
             normalized_audio_cues.append(
                 {
-                    "type": cue.get("type", "ambient"),
+                    "type": _normalize_audio_cue_type(cue.get("type", "ambient")),
                     "text": cue.get("text", cue.get("content", "")),
                     "character_id": _resolve_id(cue.get("character_id", "") or cue.get("name", ""))
                     or None,
@@ -543,3 +632,44 @@ def build_timeline_plan_from_shots(
         segments=segments,
         total_duration_seconds=cursor,
     )
+
+
+def align_shot_durations_to_scene_targets(
+    shots: list[Shot],
+    scenes: list[Scene],
+    *,
+    tolerance_seconds: float = 0.25,
+) -> list[Shot]:
+    """Scale each scene's shot durations back to the scene duration target."""
+    if not shots or not scenes:
+        return shots
+
+    scene_targets = {scene.id: scene.duration_seconds for scene in scenes}
+    shots_by_scene: dict[str, list[Shot]] = {}
+    for shot in shots:
+        if shot.scene_id in scene_targets:
+            shots_by_scene.setdefault(shot.scene_id, []).append(shot)
+
+    updated_by_id: dict[str, Shot] = {}
+    for scene_id, scene_shots in shots_by_scene.items():
+        current_total = sum(max(0.0, shot.duration_seconds) for shot in scene_shots)
+        target_total = scene_targets[scene_id]
+        if current_total <= 0 or target_total <= 0:
+            continue
+        if abs(current_total - target_total) <= tolerance_seconds:
+            continue
+
+        scale = target_total / current_total
+        rounded_durations = [
+            max(0.5, round(shot.duration_seconds * scale, 1))
+            for shot in scene_shots
+        ]
+        drift = round(target_total - sum(rounded_durations), 1)
+        rounded_durations[-1] = max(0.5, round(rounded_durations[-1] + drift, 1))
+
+        for shot, duration in zip(scene_shots, rounded_durations, strict=True):
+            updated_by_id[shot.id] = shot.model_copy(
+                update={"duration_seconds": duration}
+            )
+
+    return [updated_by_id.get(shot.id, shot) for shot in shots]

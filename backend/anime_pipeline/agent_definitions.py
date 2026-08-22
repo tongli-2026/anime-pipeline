@@ -1,57 +1,25 @@
-# ==============================================================
+# ============================================================================
 # Agent Definitions
-# ==============================================================
 #
-# ┌─ Design Intent ─────────────────────────────────────────────┐
-# │                                                             │
-# │  An "AgentDefinition" here is NOT an autonomous agent.     │
-# │  It is a static configuration for a single LLM call:       │
-# │    - which model to use (sonnet / haiku)                   │
-# │    - what system prompt to send                            │
-# │    - what the role's responsibility is                     │
-# │                                                             │
-# │  All calls are driven sequentially by the single           │
-# │  run_pipeline() coroutine in pipeline_orchestrator.py      │
-# │  (Single Director pattern). An AgentDefinition has no      │
-# │  control flow of its own and cannot decide what comes next.│
-# │                                                             │
-# └─────────────────────────────────────────────────────────────┘
+# Static, declarative configurations for single LLM calls used by the
+# pipeline orchestrator. An `AgentDefinition` describes: the logical
+# role (what the LLM is responsible for), which model tier to use
+# (creative `sonnet` vs structured `haiku`), the system prompt, and
+# size/behavioral overrides. These definitions are NOT autonomous
+# agents — they are invoked synchronously by the orchestrator
+# (single-director pattern) and produce deterministic JSON/text outputs
+# consumed by downstream pipeline stages.
 #
-# ┌─ Why Not True Multi-Agent? ─────────────────────────────────┐
-# │                                                             │
-# │  The 8 pipeline stages form a strict dependency chain:     │
-# │    Character → Story → Scenes → Prompts → Generation       │
-# │  Each step requires the full output of the previous one,   │
-# │  so there is nothing to parallelise at the LLM layer.      │
-# │  Introducing autonomous agents would add complexity with   │
-# │  no throughput benefit.                                    │
-# │                                                             │
-# │  The only parallel layer is image/video generation         │
-# │  (asyncio.gather in tools/image_gen.py), which does not   │
-# │  involve the LLM at all.                                   │
-# │                                                             │
-# └─────────────────────────────────────────────────────────────┘
+# Model tiers (high level):
+#   - `sonnet`: creative, long-form generation (character proposals,
+#       story writing). Higher token budgets and more open-ended output.
+#   - `haiku`: structured extraction and templating (scene breakdown,
+#       shot planning, prompt building, TTS script). Constrained JSON
+#       outputs, lower cost, and deterministic formatting.
 #
-# ┌─ Model Tiering Strategy ────────────────────────────────────┐
-# │                                                             │
-# │  sonnet  →  stages that require creativity / long-form     │
-# │               • character-proposal  (character design)     │
-# │               • story-generation    (narrative writing)    │
-# │                                                             │
-# │  haiku   →  GPT-5.4 mini structured output tier            │
-# │               • scene-breakdown     (JSON extraction)      │
-# │               • secondary-character (batch generation)     │
-# │               • shot-planning       (shot decomposition)   │
-# │               • scene-prompt-builder(prompt assembly)      │
-# │               • tts-script          (SSML formatting)      │
-# │                                                             │
-# │  The structured tier uses Claude Haiku as API fallback.    │
-# │                                                             │
-# └─────────────────────────────────────────────────────────────┘
-#
-# Usage (see agent_runner.py):
-#   result = await run_agent(STORY_GENERATION_AGENT, prompt, client)
-# ==============================================================
+# See `agent_runner.py` for the execution wrapper and `pipeline_orchestrator.py`
+# for how these agent configs are sequenced during a run.
+# ============================================================================
 
 from __future__ import annotations
 
@@ -158,6 +126,8 @@ For each scene, output:
 - characters: list of character names who appear in this scene
 - dialogue: optional 0–6 spoken lines when dialogue is needed
 - inner_monologue: optional 0–4 lines when emotional subtext matters
+- audio_cues: optional spoken narration/ambient thought fragments not owned by a
+  named character, e.g. crowd thought-ribbon whispers with mixed male/female voices
 
 Balance:
 - Vary mood across scenes (no 5 consecutive "tense" scenes)
@@ -184,7 +154,14 @@ CRITICAL: Output ONLY a single JSON object with this structure (no preamble, no 
       "duration_seconds": 10.5,
       "characters": ["Character 1", "Character 2"],
       "dialogue": ["Line 1", "Line 2"],
-      "inner_monologue": ["A private thought if needed"]
+      "inner_monologue": ["A private thought if needed"],
+      "audio_cues": [
+        {
+          "type": "ambient",
+          "text": "A visible thought-ribbon fragment if it should be heard aloud",
+          "emotion": "female_young; anxious whisper"
+        }
+      ]
     }
   ]
 }
@@ -254,6 +231,10 @@ Each scene object must have these fields:
 
 Rules:
 - Do NOT invent new primary characters — only assign from the locked list
+- Every dialogue item must be {"character_id": "<locked character id>", "text": "...", "emotion": "..."}.
+  Never use speaker/line or speaker_id/line aliases.
+- Every inner_monologue item must identify its speaking character with character_id.
+  Use an audio cue of type narration when no character owns the voice.
 - If a scene needs a "crowd", "guard", "bystander", etc., mark it with:
   secondary_characters_needed: ["description1", "description2"]
 - Keep CharacterState consistent with the scene's mood and narrative moment
@@ -313,6 +294,15 @@ Rules:
 - Total shot durations within a scene should approximately match the scene duration
 - Important scenes should usually have more than one shot
 - Use inner_monologue when emotional subtext matters even if dialogue is sparse
+- Every dialogue item must use character_id, text, and emotion; never speaker/line aliases
+- Every inner_monologue item must include the character_id of the character whose voice is heard
+- Use audio_cues with type "ambient" for audible crowd thought-ribbon fragments.
+  For anonymous thought voices, leave character_id empty and put a stable voice hint
+  in emotion, such as "male_young; hurried whisper" or "female_young; anxious whisper".
+  Ambient TTS cue text must be the exact words to speak, not sound-design
+  description. Keep each ambient thought cue under 8 words, e.g. "test tomorrow"
+  or "don't look at me". Put non-spoken wind, silence, density, or texture notes
+  in audio_cues only when they should not be read by TTS.
 - Spoken dialogue is optional; some shots should rely on silence, reaction, or inner monologue instead
 - Prefer hybrid or video only for motion-critical shots
 - Output concise but production-usable keyframe prompts
@@ -418,21 +408,24 @@ TTS_SCRIPT_AGENT = AgentDefinition(
     readonly=False,
     system_prompt="""You are a voice direction specialist for anime dubbing.
 
-You will receive spoken lines and inner monologue lines, each with:
-- character_id, text, emotion, type
+You will receive spoken dialogue and inner monologue lines, each with:
+- line_id, scene_id, optional shot_id, character_id, text, emotion, type, voice_profile
 
 For each line, output:
+- line_id: preserve the input line_id exactly
+- scene_id: preserve the input scene_id exactly
+- shot_id: preserve the input shot_id exactly when provided
 - character_id
 - text: the line as-is
-- type: preserve the input type (dialogue or inner_monologue)
-- ssml: SSML-formatted version with appropriate <prosody> tags:
-  - For happy/excited: rate="fast" pitch="+2st"
-  - For sad/melancholy: rate="slow" pitch="-2st"
-  - For angry: rate="medium" pitch="+1st" volume="loud"
-  - For calm/neutral: no modifications
-- voice_hint: suggested voice characteristic (e.g., "young female, gentle")
+- type: preserve the input type (dialogue, inner_monologue, narration, or ambient)
+- ssml: plain text only, no XML/SSML tags. Keep the spoken words natural.
+- voice_hint: copy the input voice_profile exactly. Do not invent a new voice per line.
+- delivery_instructions: one concise sentence describing acting direction for this exact line,
+  including emotion, volume, pace, and texture when useful.
+- speed: numeric speech speed from 0.25 to 4.0. Prefer subtle values between 0.85 and 1.12.
 - pause_before_ms: suggested pause before line in ms (0–2000)
 
+Do not invent narration, ambient thoughts, crowd whispers, or extra commentary.
 Output format: JSON array of TTS-ready script lines, ordered by scene/shot order.""",
 )
 

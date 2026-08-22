@@ -45,6 +45,7 @@ from .cost_tracker import (
     zero_cost,
 )
 from .env import get_config
+from .generation_planning import build_generation_units
 from .models import (
     BudgetConfig,
     BudgetWarningPayload,
@@ -52,7 +53,9 @@ from .models import (
     CharacterReferenceImage,
     CharacterReferencePack,
     CharacterSelectionPayload,
+    ContinuityMode,
     CostRecord,
+    GenerationUnit,
     LockedCharacter,
     PipelineState,
     Scene,
@@ -67,6 +70,9 @@ from .models import (
     TimelinePlan,
     UserInput,
     VideoProvider,
+)
+from .normalizers import (
+    align_shot_durations_to_scene_targets as _align_shot_durations_to_scene_targets,
 )
 from .normalizers import (
     build_timeline_plan_from_shots as _build_timeline_plan_from_shots,
@@ -110,9 +116,11 @@ from .prompt_builders import (
     _build_story_prompt,
     _build_tts_script_input,
     _chunk_shots_for_prompt_builder,  # noqa: F401
+    _collect_tts_script_lines,
     _run_scene_prompt_builder,
     _serialize_scene_prompt_builder_shot,  # noqa: F401
 )
+from .quality import get_quality_profile
 from .tools.ffmpeg_compose import compose_video
 from .tools.image_gen import (
     generate_character_images,
@@ -122,6 +130,7 @@ from .tools.image_gen import (
     generate_shot_hybrid,
 )
 from .tools.tts_gen import TTSLine, generate_tts
+from .voice_profiles import ensure_character_voice_profiles, resolve_voice_profile_for_line
 
 console = Console()
 
@@ -227,17 +236,30 @@ async def _lock_user_defined_characters(
 
 @dataclass
 class PipelineOptions:
-    """Configuration options for pipeline execution.
+    """Pipeline execution options.
 
-    Args:
-        budget: Optional budget override (uses UserInput.budget if not set)
-        quality_preset: Image/video generation quality ("draft", "standard", "high")
-        skip_secondary_char_review: Skip optional secondary character checkpoint
-        skip_scene_review: Skip optional scene review checkpoint
-        dry_run: Calculate costs but don't generate (test mode)
-        budget_mode: Strategy for provider selection ("budget", "balanced", "quality")
-        video_provider: Override video provider ("auto", "seedance", "kling", "runway")
-        tts_provider: Override TTS provider ("auto", "openai", "google", "elevenlabs")
+    Field precedence and purpose:
+        - `budget`: Optional `BudgetConfig` override. If not provided, `UserInput.budget`
+            is used, then environment defaults.
+        - `quality_preset`: One of `draft`, `standard`, or `high`. Controls image/video
+            generation fidelity and influences cost estimates.
+        - `budget_mode`: Provider-selection hint used by generators to favor cheaper
+            or higher-quality providers (`budget`, `balanced`, `quality`). This is a
+            hint only; the pipeline keeps selection explicit unless overridden.
+
+    Other flags:
+        - `skip_secondary_char_review`, `skip_scene_review`: Skip optional human checkpoints.
+        - `dry_run`: Compute estimates and plan without producing assets.
+        - `video_provider`, `tts_provider`: Explicit provider overrides; use "auto"
+            to let the pipeline pick based on budget/quality.
+        - `min_video_duration_seconds`, `max_video_duration_seconds`: Controls how
+            shots are grouped into provider requests (generation units).
+
+    Notes:
+        - The orchestrator provides the authoritative pre-generation cost estimate
+            (see `estimate_pipeline_cost` in `cost_tracker.py`). Treat it as advisory.
+        - Mapping from `budget_mode` → `quality_preset` is intentionally explicit
+            (no automatic remapping is performed here).
     """
 
     budget: BudgetConfig | None = None
@@ -248,6 +270,8 @@ class PipelineOptions:
     budget_mode: Literal["budget", "balanced", "quality"] = "balanced"
     video_provider: VideoProvider = "auto"
     tts_provider: Literal["auto", "openai", "google", "elevenlabs"] = "auto"
+    min_video_duration_seconds: float = 4.0
+    max_video_duration_seconds: float = 12.0
 
 
 def _apply_scene_review_resolution(
@@ -288,6 +312,118 @@ def _set_shot_plan(state: PipelineState, shot_plan: ShotPlan) -> PipelineState:
 
 def _set_timeline_plan(state: PipelineState, timeline_plan: TimelinePlan) -> PipelineState:
     return state.model_copy(update={"timeline_plan": timeline_plan, "updated_at": time.time()})
+
+
+def _set_generation_units(
+    state: PipelineState,
+    generation_units: list[GenerationUnit],
+) -> PipelineState:
+    return state.model_copy(
+        update={"generation_units": generation_units, "updated_at": time.time()}
+    )
+
+
+def _replace_generation_unit(
+    state: PipelineState,
+    replacement: GenerationUnit,
+) -> PipelineState:
+    units = [
+        replacement if unit.id == replacement.id else unit
+        for unit in state.generation_units
+    ]
+    return _set_generation_units(state, units)
+
+
+def _attach_generation_units_to_timeline(
+    state: PipelineState,
+    generation_units: list[GenerationUnit],
+) -> PipelineState:
+    if state.timeline_plan is None:
+        return state
+    unit_by_shot_id = {
+        shot_id: unit.id
+        for unit in generation_units
+        for shot_id in unit.source_shot_ids
+    }
+    segments = [
+        segment.model_copy(
+            update={"generation_unit_id": unit_by_shot_id.get(segment.shot_id or "")}
+        )
+        for segment in state.timeline_plan.segments
+    ]
+    return _set_timeline_plan(
+        state,
+        state.timeline_plan.model_copy(update={"segments": segments}),
+    )
+
+
+def _apply_generation_unit_result_to_sources(
+    state: PipelineState,
+    unit: GenerationUnit,
+) -> PipelineState:
+    """Expose one unit's shared artifacts through its original shots and timeline."""
+    output = unit.shot.output
+    if output is None:
+        return state
+
+    source_ids = set(unit.source_shot_ids)
+    first_id = unit.source_shot_ids[0]
+    last_id = unit.source_shot_ids[-1]
+    if state.shot_plan is not None:
+        shots = []
+        for shot in state.shot_plan.shots:
+            if shot.id not in source_ids:
+                shots.append(shot)
+                continue
+            update: dict[str, Any] = {"output": output}
+            if shot.id == first_id and unit.shot.opening_frame_path:
+                update["opening_frame_path"] = unit.shot.opening_frame_path
+            if shot.id == last_id and unit.shot.ending_frame_path:
+                update["ending_frame_path"] = unit.shot.ending_frame_path
+            shots.append(shot.model_copy(update=update))
+        state = _set_shot_plan(state, state.shot_plan.model_copy(update={"shots": shots}))
+
+    if state.timeline_plan is not None:
+        segments = []
+        for segment in state.timeline_plan.segments:
+            if segment.shot_id not in source_ids:
+                segments.append(segment)
+                continue
+            update = {
+                "generation_unit_id": unit.id,
+                "visual_source_path": output.file_path,
+            }
+            if segment.shot_id == first_id and unit.shot.opening_frame_path:
+                update["opening_frame_path"] = unit.shot.opening_frame_path
+            if segment.shot_id == last_id and unit.shot.ending_frame_path:
+                update["ending_frame_path"] = unit.shot.ending_frame_path
+            segments.append(segment.model_copy(update=update))
+        state = _set_timeline_plan(
+            state,
+            state.timeline_plan.model_copy(update={"segments": segments}),
+        )
+    return state
+
+
+def _print_generation_unit_summary(units: list[GenerationUnit], shot_count: int) -> None:
+    merged_units = [unit for unit in units if len(unit.source_shot_ids) > 1]
+    console.print(
+        f"[dim]Generation plan: {shot_count} shot(s) -> "
+        f"{len(units)} provider request(s).[/dim]"
+    )
+    if not merged_units:
+        console.print("[dim]Merged groups: none[/dim]")
+        return
+
+    console.print("[dim]Merged groups:[/dim]")
+    for unit in merged_units:
+        indexes = ", ".join(str(index) for index in unit.source_shot_indexes)
+        ids = ", ".join(unit.source_shot_ids)
+        console.print(
+            f"[dim]  unit {unit.index + 1}: shot index [{indexes}] "
+            f"({ids}) -> {unit.shot.duration_seconds:.1f}s "
+            f"[{unit.status}][/dim]"
+        )
 
 
 def _update_shot_plan_prompt(
@@ -372,6 +508,74 @@ def _update_shot_keyframe_paths(
             updated_shots.append(shot)
 
     return _set_shot_plan(state, state.shot_plan.model_copy(update={"shots": updated_shots}))
+
+
+def _resolve_shot_continuity(
+    previous_shot: Shot | None,
+    current_shot: Shot,
+    previous_ending_path: str | None,
+) -> tuple[Shot, ContinuityMode]:
+    """Resolve automatic continuity and attach the previous frame in the appropriate role."""
+    mode = current_shot.continuity_mode
+    source_path = (
+        current_shot.opening_frame_path
+        or current_shot.keyframes.opening_frame_reference
+        or previous_ending_path
+    )
+
+    if mode == "auto":
+        if current_shot.opening_frame_path:
+            mode = "exact"
+        elif current_shot.keyframes.opening_frame_reference:
+            mode = "reference"
+        elif previous_shot is None or not previous_ending_path:
+            mode = "cut"
+        elif (
+            current_shot.scene_id != previous_shot.scene_id
+            or current_shot.location != previous_shot.location
+            or current_shot.time_of_day != previous_shot.time_of_day
+        ):
+            mode = "cut"
+        elif (
+            current_shot.shot_scale != previous_shot.shot_scale
+            or current_shot.camera_angle != previous_shot.camera_angle
+        ):
+            mode = "reference"
+        else:
+            mode = "exact"
+
+    keyframes = current_shot.keyframes
+    if mode == "exact" and source_path:
+        return current_shot.model_copy(
+            update={
+                "continuity_mode": mode,
+                "opening_frame_path": source_path,
+                "keyframes": keyframes.model_copy(update={"opening_frame_reference": None}),
+            }
+        ), mode
+    if mode == "reference" and source_path:
+        return current_shot.model_copy(
+            update={
+                "continuity_mode": mode,
+                "opening_frame_path": None,
+                "keyframes": keyframes.model_copy(update={"opening_frame_reference": source_path}),
+            }
+        ), mode
+
+    return current_shot.model_copy(
+        update={
+            "continuity_mode": "cut",
+            "opening_frame_path": None,
+            "keyframes": keyframes.model_copy(update={"opening_frame_reference": None}),
+        }
+    ), "cut"
+
+
+def _replace_shot(state: PipelineState, replacement: Shot) -> PipelineState:
+    if state.shot_plan is None:
+        return state
+    shots = [replacement if shot.id == replacement.id else shot for shot in state.shot_plan.shots]
+    return _set_shot_plan(state, state.shot_plan.model_copy(update={"shots": shots}))
 
 
 def _update_timeline_segment_keyframe_paths(
@@ -488,11 +692,33 @@ async def run_pipeline(
     budget = _resolve_budget(user_input, options)
 
     client = create_llm_router()
+    user_input = user_input.model_copy(
+        update={"quality_preset": options.quality_preset}
+    )
     state = create_initial_state(user_input, budget)
 
     # Pre-flight cost estimate
     if not options.dry_run:
-        estimate = estimate_pipeline_cost(12, 3, 2, 200, options.quality_preset)
+        # Derive a lightweight heuristic from `user_input` to produce a
+        # more accurate pre-generation estimate instead of hard-coded numbers.
+        target_secs = getattr(user_input, "target_duration_seconds", None) or 180
+        # Estimate scenes by dividing target duration into ~15s scenes
+        scene_count = max(1, int(target_secs / 15))
+        # Key scenes are roughly one per 4 scenes, clamped to [1, 3]
+        key_scene_count = min(3, max(1, scene_count // 4))
+        primary_character_count = len(user_input.primary_characters or []) or 1
+        story_outline_chars = len(user_input.story_outline or "")
+        avg_dialogue_chars_per_scene = (
+            max(50, int(story_outline_chars / scene_count)) if story_outline_chars > 0 else 100
+        )
+
+        estimate = estimate_pipeline_cost(
+            scene_count,
+            key_scene_count,
+            primary_character_count,
+            avg_dialogue_chars_per_scene,
+            options.quality_preset,
+        )
         console.print("\n[bold]📊 Cost Estimate (before generation):[/bold]")
         console.print(format_cost_summary(estimate))
         budget_check = check_budget(estimate.total_cost_usd, budget)
@@ -729,13 +955,13 @@ async def run_pipeline(
         image_scenes = [s for s in state.story.scenes if not s.needs_video]  # type: ignore[union-attr]
         from .cost_tracker import calc_image_cost, calc_video_cost
 
-        video_quality: Literal["standard", "hd"] = (
-            "hd" if options.quality_preset == "high" else "standard"
-        )
+        quality_profile = get_quality_profile(options.quality_preset)
+        video_quality = quality_profile.video_quality
         est_vid_cost = len(video_scenes) * calc_video_cost(
             5.0,
             estimated_video_provider,
             quality=video_quality,
+            resolution=quality_profile.video_resolution,
         ).total_cost_usd
         est_img_cost = len(image_scenes) * calc_image_cost(1, "standard").total_cost_usd
         console.print("\n[bold]🎬 Scene Distribution (optimized by budget):[/bold]")
@@ -796,6 +1022,15 @@ async def run_pipeline(
 
             shots = _attach_shot_character_anchors(shots, state)
             console.print(f"[green]✓ Attached character anchors to {len(shots)} shots[/green]")
+            if state.story is not None:
+                before_duration = sum(shot.duration_seconds for shot in shots)
+                shots = _align_shot_durations_to_scene_targets(shots, state.story.scenes)
+                after_duration = sum(shot.duration_seconds for shot in shots)
+                if abs(after_duration - before_duration) > 0.25:
+                    console.print(
+                        "[cyan]→ Reconciled shot durations to scene targets: "
+                        f"{before_duration:.1f}s → {after_duration:.1f}s[/cyan]"
+                    )
 
             shot_plan = ShotPlan(
                 story_id=state.story.id if state.story else None,
@@ -1024,6 +1259,15 @@ async def run_from_scene_breakdown_state(
     if options is None:
         options = PipelineOptions()
 
+    state = state.model_copy(
+        update={
+            "quality_preset": options.quality_preset,
+            "user_input": state.user_input.model_copy(
+                update={"quality_preset": options.quality_preset}
+            ),
+        }
+    )
+
     if state.story is None or not state.story.scenes:
         raise ValueError("State must contain story.scenes to resume from scene breakdown")
     if not state.characters.locked:
@@ -1051,13 +1295,13 @@ async def run_from_scene_breakdown_state(
         image_scenes = [s for s in state.story.scenes if not s.needs_video]  # type: ignore[union-attr]
         from .cost_tracker import calc_image_cost, calc_video_cost
 
-        video_quality: Literal["standard", "hd"] = (
-            "hd" if options.quality_preset == "high" else "standard"
-        )
+        quality_profile = get_quality_profile(options.quality_preset)
+        video_quality = quality_profile.video_quality
         est_vid_cost = len(video_scenes) * calc_video_cost(
             5.0,
             estimated_video_provider,
             quality=video_quality,
+            resolution=quality_profile.video_resolution,
         ).total_cost_usd
         est_img_cost = len(image_scenes) * calc_image_cost(1, "standard").total_cost_usd
         console.print("\n[bold]🎬 Scene Distribution (optimized by budget):[/bold]")
@@ -1093,6 +1337,7 @@ async def run_from_scene_breakdown_state(
             for raw_shot in shot_raw
         ]
         shots = _attach_shot_character_anchors(shots, state)
+        shots = _align_shot_durations_to_scene_targets(shots, story.scenes)
 
         shot_plan = ShotPlan(
             story_id=story.id,
@@ -1287,6 +1532,23 @@ async def run_from_generation_state(
     if options is None:
         options = PipelineOptions()
 
+    if (
+        any(unit.status == "completed" for unit in state.generation_units)
+        and options.quality_preset != state.quality_preset
+    ):
+        raise ValueError(
+            "Cannot change quality after generation has completed units; "
+            f"resume with {state.quality_preset!r}."
+        )
+    state = state.model_copy(
+        update={
+            "quality_preset": options.quality_preset,
+            "user_input": state.user_input.model_copy(
+                update={"quality_preset": options.quality_preset}
+            ),
+        }
+    )
+
     if state.story is None:
         raise ValueError("State must contain story data to resume from generation")
 
@@ -1337,69 +1599,180 @@ async def _run_generation_stage(
 
     from .models import ImageOutput, VideoOutput
 
+    console.print(
+        "\n[bold]🎨 Generation stage[/bold] "
+        f"([cyan]{options.quality_preset}[/cyan], "
+        f"[cyan]{options.budget_mode}[/cyan], video=[cyan]{options.video_provider}[/cyan])"
+    )
     if state.shot_plan and state.shot_plan.shots:
+        shot_plan = state.shot_plan
         scene_lookup = {scene.id: scene for scene in (state.story.scenes if state.story else [])}
+        if not state.generation_units:
+            generation_units = build_generation_units(
+                shot_plan.shots,
+                min_duration_seconds=options.min_video_duration_seconds,
+                max_duration_seconds=options.max_video_duration_seconds,
+            )
+            state = _set_generation_units(state, generation_units)
+            state = _attach_generation_units_to_timeline(state, generation_units)
+            _persist_state_snapshot(state)
+            console.print(
+                f"[dim]Built {len(generation_units)} generation unit(s) from "
+                f"{len(shot_plan.shots)} shot(s).[/dim]"
+            )
+        else:
+            console.print(
+                f"[dim]Resuming with {len(state.generation_units)} persisted "
+                "generation unit(s).[/dim]"
+            )
+        _print_generation_unit_summary(state.generation_units, len(shot_plan.shots))
 
-        for shot in state.shot_plan.shots:
-            if not shot.generation_prompt or shot.output is not None:
+        previous_shot: Shot | None = None
+        previous_ending_path: str | None = None
+
+        for unit_snapshot in sorted(state.generation_units, key=lambda item: item.index):
+            unit = unit_snapshot
+            shot = unit.shot
+            if shot.output is not None:
+                console.print(
+                    f"[green]✓ Skip completed unit {unit.index + 1}/"
+                    f"{len(state.generation_units)}[/green] "
+                    f"{shot.id} -> {shot.output.file_path}"
+                )
+                if unit.status != "completed":
+                    unit = unit.model_copy(
+                        update={"status": "completed", "last_error": None}
+                    )
+                    state = _replace_generation_unit(state, unit)
+                state = _apply_generation_unit_result_to_sources(state, unit)
+                previous_shot = shot
+                previous_ending_path = shot.ending_frame_path
                 continue
+
+            if not shot.generation_prompt:
+                unit = unit.model_copy(
+                    update={
+                        "status": "failed",
+                        "last_error": "Generation unit has no generation prompt",
+                    }
+                )
+                state = _replace_generation_unit(state, unit)
+                _persist_state_snapshot(state)
+                raise RuntimeError(
+                    f'Generation unit "{unit.id}" has no generation prompt'
+                )
+
+            shot, _continuity_mode = _resolve_shot_continuity(
+                previous_shot, shot, previous_ending_path
+            )
+            unit = unit.model_copy(
+                update={
+                    "shot": shot,
+                    "status": "generating",
+                    "attempt_count": unit.attempt_count + 1,
+                    "last_error": None,
+                }
+            )
+            state = _replace_generation_unit(state, unit)
+            _persist_state_snapshot(state)
 
             parent_scene = scene_lookup.get(shot.scene_id or "")
             generation_scene = _build_generation_scene_from_shot(shot, parent_scene)
+            previous_ending_path = None
 
             output: ImageOutput | VideoOutput
-            if shot.estimated_generation_mode == "hybrid":
-                file_path, cost, keyframe_paths, _hybrid_metadata = await generate_shot_hybrid(
-                    shot,
-                    options.quality_preset,
-                    video_provider=options.video_provider,
-                    budget_mode=options.budget_mode,
+            try:
+                console.print(
+                    f"[cyan]→ Generating unit {unit.index + 1}/"
+                    f"{len(state.generation_units)}[/cyan] "
+                    f"{shot.id} ({shot.estimated_generation_mode}, "
+                    f"{shot.duration_seconds:.1f}s, sources: "
+                    f"{', '.join(unit.source_shot_ids)})"
                 )
-                output = VideoOutput(file_path=file_path, cost=cost)
-                state = _update_shot_keyframe_paths(
-                    state,
-                    shot.id,
-                    opening_frame_path=keyframe_paths.get("opening"),
-                    ending_frame_path=keyframe_paths.get("ending"),
+                if shot.estimated_generation_mode == "hybrid":
+                    console.print("[dim]  Creating opening/ending keyframes, then image-to-video...[/dim]")
+                    (
+                        file_path,
+                        cost,
+                        keyframe_paths,
+                        _hybrid_metadata,
+                    ) = await generate_shot_hybrid(
+                        shot,
+                        options.quality_preset,
+                        video_provider=options.video_provider,
+                        budget_mode=options.budget_mode,
+                    )
+                    output = VideoOutput(file_path=file_path, cost=cost)
+                    previous_ending_path = keyframe_paths.get("ending")
+                    shot = shot.model_copy(
+                        update={
+                            "opening_frame_path": keyframe_paths.get("opening"),
+                            "ending_frame_path": previous_ending_path,
+                        }
+                    )
+                elif shot.estimated_generation_mode == "video":
+                    console.print("[dim]  Creating text-to-video clip...[/dim]")
+                    file_path, cost = await generate_scene_video(
+                        generation_scene,
+                        options.quality_preset,
+                        video_provider=options.video_provider,
+                        budget_mode=options.budget_mode,
+                    )
+                    output = VideoOutput(file_path=file_path, cost=cost)
+                else:
+                    console.print("[dim]  Creating still image...[/dim]")
+                    file_path, cost = await generate_scene_image(
+                        generation_scene, options.quality_preset, options.budget_mode
+                    )
+                    output = ImageOutput(
+                        file_path=file_path,
+                        transition_type="fade",
+                        cost=cost,
+                    )
+            except Exception as exc:
+                failed_unit = unit.model_copy(
+                    update={"status": "failed", "last_error": str(exc)}
                 )
-                state = _update_timeline_segment_keyframe_paths(
-                    state,
-                    shot.id,
-                    opening_frame_path=keyframe_paths.get("opening"),
-                    ending_frame_path=keyframe_paths.get("ending"),
-                )
-            elif shot.estimated_generation_mode == "video":
-                file_path, cost = await generate_scene_video(
-                    generation_scene,
-                    options.quality_preset,
-                    video_provider=options.video_provider,
-                    budget_mode=options.budget_mode,
-                )
-                output = VideoOutput(file_path=file_path, cost=cost)
-            else:
-                file_path, cost = await generate_scene_image(
-                    generation_scene, options.quality_preset, options.budget_mode
-                )
-                output = ImageOutput(file_path=file_path, transition_type="fade", cost=cost)
+                state = _replace_generation_unit(state, failed_unit)
+                _persist_state_snapshot(state)
+                raise
 
-            state = _update_shot_output(state, shot.id, output)
-            state = _update_timeline_segment_visual_path(state, shot.id, file_path)
+            shot = shot.model_copy(update={"output": output})
+            unit = unit.model_copy(
+                update={
+                    "shot": shot,
+                    "status": "completed",
+                    "last_error": None,
+                }
+            )
+            state = _replace_generation_unit(state, unit)
+            state = _apply_generation_unit_result_to_sources(state, unit)
 
             if shot.scene_id and parent_scene and parent_scene.output is None:
                 state = update_scene(state, shot.scene_id, {"output": output})
 
-            _persist_state_snapshot(state)
             gen_cost = add_costs(gen_cost, cost)
             state = _apply_cost_and_persist_state(state, cost)
+            console.print(
+                f"[green]✓ Completed unit {unit.index + 1}/"
+                f"{len(state.generation_units)}[/green] "
+                f"-> {output.file_path} (${cost.total_cost_usd:.4f})"
+            )
             state = await _handle_generation_budget_warning(state, resolver, options)
             if state.status == "aborted":
                 return state
+            previous_shot = shot
     elif state.story and state.story.scenes:
         for scene in state.story.scenes:
             if not scene.generation_prompt or scene.output is not None:
+                if scene.output is not None:
+                    console.print(
+                        f"[green]✓ Skip completed scene[/green] {scene.id} -> {scene.output.file_path}"
+                    )
                 continue
 
             if scene.type == "key" and scene.needs_video:
+                console.print(f"[cyan]→ Generating video scene[/cyan] {scene.id} ({scene.duration_seconds:.1f}s)")
                 file_path, cost = await generate_scene_video(
                     scene,
                     options.quality_preset,
@@ -1410,6 +1783,7 @@ async def _run_generation_stage(
                     state, scene.id, {"output": VideoOutput(file_path=file_path, cost=cost)}
                 )
             else:
+                console.print(f"[cyan]→ Generating still scene[/cyan] {scene.id} ({scene.duration_seconds:.1f}s)")
                 file_path, cost = await generate_scene_image(
                     scene, options.quality_preset, options.budget_mode
                 )
@@ -1428,6 +1802,7 @@ async def _run_generation_stage(
             _persist_state_snapshot(state)
             gen_cost = add_costs(gen_cost, cost)
             state = _apply_cost_and_persist_state(state, cost)
+            console.print(f"[green]✓ Completed scene[/green] {scene.id} -> {file_path} (${cost.total_cost_usd:.4f})")
             state = await _handle_generation_budget_warning(state, resolver, options)
             if state.status == "aborted":
                 return state
@@ -1438,6 +1813,7 @@ async def _run_generation_stage(
         gen_cost,
         (time.monotonic() - stage_start) * 1000,
     )
+    console.print(f"[bold green]✓ Generation stage complete[/bold green] (${gen_cost.total_cost_usd:.4f})")
     return state
 
 
@@ -1470,12 +1846,11 @@ async def _handle_generation_budget_warning(
         if cp_resolved.resolution.action == "abort":
             return transition_to(state, "complete", "aborted")
         if cp_resolved.resolution.action == "reduce_quality":
-            options.quality_preset = "draft"
-            options.video_provider = "auto"
             console.print(
-                "[yellow]Budget warning accepted: switching remaining generation "
-                "to draft quality.[/yellow]"
+                "[yellow]Quality is locked for this run to prevent mixed-resolution output. "
+                "Stopping so the pipeline can be restarted in draft mode.[/yellow]"
             )
+            return transition_to(state, "complete", "aborted")
     return state
 
 
@@ -1486,7 +1861,12 @@ async def _run_tts_stage(
 ) -> PipelineState:
     state = transition_to(state, "tts_audio")
     stage_start = time.monotonic()
+    voice_profiles = ensure_character_voice_profiles(state)
 
+    console.print("\n[bold]🔊 TTS stage[/bold]")
+    if voice_profiles:
+        console.print(f"[cyan]→ Locked {len(voice_profiles)} character voice profile(s)[/cyan]")
+    console.print("[cyan]→ Formatting dialogue and inner monologue for TTS...[/cyan]")
     tts_script_result = await run_agent(
         TTS_SCRIPT_AGENT,
         _build_tts_script_input(state),
@@ -1495,24 +1875,73 @@ async def _run_tts_stage(
 
     tts_cost = zero_cost()
     if tts_script_result.success:
-        lines = [
-            TTSLine(
-                character_id=item["character_id"],
-                text=item["text"],
-                ssml=item.get("ssml", item["text"]),
-                line_type=item.get("type", "dialogue"),
-                pause_before_ms=item.get("pause_before_ms", 0),
-                voice_hint=item.get("voice_hint", ""),
+        source_by_id = {
+            item["line_id"]: item
+            for item in _collect_tts_script_lines(state)
+            if item.get("line_id")
+        }
+        lines: list[TTSLine] = []
+        for item in tts_script_result.data:
+            source = source_by_id.get(item.get("line_id", ""), {})
+            character_id = source.get("character_id") or item.get("character_id") or ""
+            text = source.get("text") or item["text"]
+            lines.append(
+                TTSLine(
+                    character_id=character_id,
+                    text=text,
+                    ssml=item.get("ssml", text),
+                    line_id=item.get("line_id", ""),
+                    shot_id=source.get("shot_id") or item.get("shot_id"),
+                    scene_id=source.get("scene_id") or item.get("scene_id"),
+                    line_type=source.get("type") or item.get("type", "dialogue"),
+                    pause_before_ms=item.get("pause_before_ms", 0),
+                    voice_hint=resolve_voice_profile_for_line(
+                        character_id,
+                        voice_profiles,
+                        source.get("voice_profile") or item.get("voice_hint", ""),
+                    ),
+                    delivery_instructions=item.get("delivery_instructions", ""),
+                    speed=item.get("speed"),
+                )
             )
-            for item in tts_script_result.data
-        ]
+
+        character_names = {
+            character.id: character.name for character in state.characters.locked
+        }
+        character_names.update(
+            {
+                character.id: character.name
+                for character in state.characters.secondary
+            }
+        )
+        routes = sorted(
+            {
+                f"{character_names.get(line.character_id, 'narrator')}={line.voice_hint.split(';')[0]}"
+                for line in lines
+            }
+        )
+        if routes:
+            console.print(f"[cyan]→ Voice routes: {', '.join(routes)}[/cyan]")
+        unresolved_count = sum(not line.character_id for line in lines)
+        if unresolved_count:
+            console.print(
+                f"[yellow]⚠️  {unresolved_count} line(s) have no character owner; "
+                "using the neutral narrator voice.[/yellow]"
+            )
+        console.print(
+            f"[cyan]→ Generating {len(lines)} TTS line(s)[/cyan] "
+            f"(provider={options.tts_provider}, budget={options.budget_mode})"
+        )
         _audio_files, tts_audio_cost = await generate_tts(
             lines,
             tts_provider=options.tts_provider,
             budget_mode=options.budget_mode,
         )
+        console.print(f"[green]✓ Generated {len(_audio_files)} TTS audio file(s)[/green]")
         tts_cost = add_costs(tts_script_result.cost, tts_audio_cost)
         state = _apply_cost_and_persist_state(state, tts_cost)
+    else:
+        console.print(f"[yellow]⚠️  TTS script agent failed: {tts_script_result.error}[/yellow]")
 
     state = record_stage_complete(
         state,
@@ -1521,6 +1950,7 @@ async def _run_tts_stage(
         (time.monotonic() - stage_start) * 1000,
     )
     _persist_state_snapshot(state)
+    console.print(f"[bold green]✓ TTS stage complete[/bold green] (${tts_cost.total_cost_usd:.4f})")
     return state
 
 
@@ -1530,6 +1960,8 @@ async def _run_video_composition_stage(
     state = transition_to(state, "video_composition")
     stage_start = time.monotonic()
 
+    console.print("\n[bold]🎞️ Composition stage[/bold]")
+    console.print("[cyan]→ Normalizing clips, aligning TTS audio, and writing final MP4...[/cyan]")
     output_path, compose_cost = await compose_video(state)
     state = _apply_cost_and_persist_state(state, compose_cost)
     state = record_stage_complete(
@@ -1539,4 +1971,5 @@ async def _run_video_composition_stage(
         (time.monotonic() - stage_start) * 1000,
     )
     _persist_state_snapshot(state)
+    console.print(f"[bold green]✓ Composition stage complete[/bold green] -> [cyan]{output_path}[/cyan]")
     return state, output_path

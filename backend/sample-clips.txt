@@ -1,2 +1,0 @@
-file '/Users/tong/AIProjects/anime-pipeline/backend/output/videos/shot_example-shot-1-01b52ffa.mp4'
-file '/Users/tong/AIProjects/anime-pipeline/backend/output/videos/shot_example-shot-2-48c94cd7.mp4'

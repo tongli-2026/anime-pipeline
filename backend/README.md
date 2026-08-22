@@ -41,6 +41,10 @@ cp .env.example .env   # add your ANTHROPIC_API_KEY
 # Interactive CLI pipeline
 python -m anime_pipeline.main
 
+# Non-interactive run with an explicit end-to-end output quality
+python -m anime_pipeline.main --input-file input/story_request.before-you-judge.json \
+  --quality-preset high --auto
+
 # Resume from a saved state snapshot
 python -m anime_pipeline.main --state-file output/state_<run_id>.json --auto
 
@@ -48,37 +52,82 @@ python -m anime_pipeline.main --state-file output/state_<run_id>.json --auto
 anime-pipeline
 ```
 
+## Output quality
+
+The selected quality preset is shared by scene images, hybrid keyframes, video
+provider requests, and final FFmpeg composition. Scene/keyframe images are
+normalized to the same 16:9 canvas before they are sent to image-to-video models.
+Character reference sheets keep their original portrait or full-body framing.
+
+| Preset | Canvas and video request | Final encoding |
+|--------|--------------------------|----------------|
+| `draft` | 854x480 / 480p | Fast preview, CRF 26 |
+| `standard` | 1280x720 / 720p | Balanced output, CRF 20 |
+| `high` | 1920x1080 / 1080p | Slower high-quality output, CRF 17 |
+
+Without `--auto`, the CLI prompts for the output quality. With `--auto`, it uses
+`--quality-preset` when supplied, otherwise the `quality_preset` saved in the
+input JSON or pipeline state. A resumed run with completed generation units keeps
+its original preset to avoid mixing resolutions.
+
 ## Image provider policy
 
-Image generation uses cost-aware stage routing. Draft character candidates and
-ordinary scene images prefer fal.ai FLUX Dev. A primary character's starter pack
-generates only three high-value assets: a three-quarter portrait, a front-facing
-full-body view, and an expression sheet. Existing views are reused instead of
-regenerated; side and back views remain available for later shot-driven expansion.
-Provider selection follows the active budget mode:
+Image generation uses one simple provider policy across character candidates,
+ordinary scene images, shot keyframes, and reference packs:
 
-| Mode | Ordinary images | Shot keyframes | Reference packs |
-|------|-----------------|----------------|-----------------|
-| `budget` | fal.ai | fal.ai | fal.ai image-to-image |
-| `balanced` | `IMAGE_PROVIDER_DEFAULT` | `IMAGE_PROVIDER_KEYFRAME` | `IMAGE_PROVIDER_REFERENCE` |
-| `quality` | GPT Image 2 | GPT Image 2 | GPT Image 2 edit |
+| Selection | Preferred image provider |
+|-----------|--------------------------|
+| `--quality-preset draft` | fal.ai FLUX Dev |
+| `--budget-mode budget` | fal.ai FLUX Dev |
+| `--budget-mode balanced` with `standard` or `high` quality | GPT Image 2 |
+| `--budget-mode quality` with `standard` or `high` quality | GPT Image 2 |
 
-Balanced mode defaults to `fal`, `openai`, and `fal` respectively. Each variable
-also accepts `openai` or `replicate`; providers that cannot perform a reference
-edit fall back to text-to-image. API failures continue through the configured
-fallback chain. `OPENAI_API_KEY` is shared with OpenAI TTS, and API usage is
-billed separately from a ChatGPT subscription.
+A primary character's starter pack generates only three high-value assets: a
+three-quarter portrait, a front-facing full-body view, and an expression sheet.
+Existing views are reused instead of regenerated; side and back views remain
+available for later shot-driven expansion. API failures continue through the
+fallback chain when another compatible provider is available. `OPENAI_API_KEY`
+is shared with OpenAI TTS, and API usage is billed separately from a ChatGPT
+subscription.
 
 fal.ai estimates account for whole-megapixel rounding: approximately $0.025 for
 standard text-to-image and $0.05 for the 16:9 HD preset. GPT Image 2 records cost
 from token usage returned by the API and uses conservative estimates for upfront
 budget planning.
 
+### Shot continuity
+
+Each shot has a `continuity_mode` field with `auto`, `exact`, `reference`, and
+`cut` options. In `auto` mode, the generation stage selects `cut` for a new
+scene/location/time, `reference` when the scene is unchanged but camera scale or
+angle changes, and `exact` for a continuous shot with the same camera setup.
+`exact` reuses the previous ending frame; `reference` redraws the opening frame
+from it while allowing the requested recomposition. An explicit mode always
+overrides automatic routing.
+
+Generate a low-cost scene sequence without running the full pipeline:
+
+```bash
+anime-pipeline-sequence --save-example sample-scene.json
+anime-pipeline-sequence \
+  --scene-file sample-scene.json \
+  --quality-preset standard \
+  --budget-mode balanced \
+  --video-provider seedance \
+  --output-video output/sample-scene.mp4 \
+  --output-json sample-scene-result.json
+```
+
+Shots run sequentially so each `auto` continuity decision can use the previous
+ending frame. The result JSON records requested and resolved continuity modes,
+per-shot media/keyframes and costs, total cost, and the composed scene path.
+
 ## Video provider policy
 
-`auto` and the single-shot CLI default to Seedance 1.5 Pro at 720p with generated
-audio disabled. The final soundtrack is produced separately by the TTS and FFmpeg
-stages, so paying for model-native audio would be redundant.
+`auto` and the single-shot CLI default to Seedance 1.5 Pro, using 480p, 720p, or
+1080p according to the selected output-quality preset, with generated audio
+disabled. The final soundtrack is produced separately by the TTS and FFmpeg stages,
+so paying for model-native audio would be redundant.
 
 Set `SEEDANCE_API_KEY` to use a dedicated fal.ai credential for Seedance. When it
 is empty, Seedance reuses `FAL_KEY` for backward compatibility.

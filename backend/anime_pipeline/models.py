@@ -1,7 +1,21 @@
 # ==============================================================
-# Core Domain Models for the Anime Generation Pipeline
+# Core Domain Models — Pydantic v2
 #
-# Pydantic v2 models for all domain entities (Character, Scene, Story, Cost, State, etc.)
+# Definitions for the pipeline domain: characters, scenes, shots, generation
+# units, timeline segments, cost records, and the pipeline state machine.
+# These models are the authoritative schema for state serialization,
+# inter-stage communication, and validation.
+#
+# Maintainer notes:
+#  - Models target Pydantic v2. Use `model_copy` for updates and
+#    `model_validate` / `model_dump_json` for input/output boundaries.
+#  - Keep field names stable: changing persisted fields requires a migration
+#    path or sensible defaults to preserve backward compatibility with saved
+#    `PipelineState` JSON files.
+#  - Prefer `Field(default_factory=...)` for runtime defaults (UUIDs, timestamps,
+#    CostRecord). Avoid side-effectful module-level code at import time.
+#  - Favor explicit unions and small, well-typed models rather than generic
+#    dicts; this reduces downstream parsing complexity.
 # ==============================================================
 
 from __future__ import annotations
@@ -20,6 +34,8 @@ CharacterTier = Literal["primary", "secondary"]
 VideoProvider = Literal["auto", "seedance", "kling", "runway"]
 BillableVideoProvider = Literal["seedance", "kling", "runway"]
 VideoGenerationMode = Literal["text_to_video", "image_to_video"]
+ContinuityMode = Literal["auto", "exact", "reference", "cut"]
+QualityPreset = Literal["draft", "standard", "high"]
 ReferenceViewType = Literal[
     "portrait_front",
     "portrait_left",
@@ -62,6 +78,7 @@ class LockedCharacter(BaseModel):
     reference_pack: CharacterReferencePack = Field(default_factory=lambda: CharacterReferencePack())
     prompt_base: str      # core visual description, locked
     seed: int             # generation seed, locked for consistency
+    voice_profile: str | None = None
     locked_at: float = Field(default_factory=time.time)
 
 
@@ -84,6 +101,7 @@ class SecondaryCharacter(BaseModel):
     tier: Literal["secondary"] = "secondary"
     prompt_base: str
     seed: int
+    voice_profile: str | None = None
     auto_approved: bool = True   # True = skipped user confirmation
     generation_cost: CostRecord = Field(default_factory=CostRecord)
 
@@ -203,6 +221,7 @@ SceneType = Literal["key", "normal"]
 
 
 class DialogueLine(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     character_id: str
     text: str
     emotion: str
@@ -265,12 +284,29 @@ class Shot(BaseModel):
     inner_monologue: list[AudioCue] = Field(default_factory=list)
     audio_cues: list[AudioCue] = Field(default_factory=list)
     keyframes: KeyframePlan = Field(default_factory=KeyframePlan)
+    continuity_mode: ContinuityMode = "auto"
     opening_frame_path: str | None = None
     ending_frame_path: str | None = None
     generation_prompt: str | None = None
     negative_prompt: str | None = None
     estimated_generation_mode: Literal["image", "video", "hybrid"] = "image"
     output: SceneOutput | None = None
+
+
+GenerationUnitStatus = Literal["pending", "generating", "completed", "failed"]
+
+
+class GenerationUnit(BaseModel):
+    """Persisted provider request built from one or more adjacent source shots."""
+
+    id: str
+    index: int
+    source_shot_ids: list[str]
+    source_shot_indexes: list[int]
+    shot: Shot
+    status: GenerationUnitStatus = "pending"
+    attempt_count: int = 0
+    last_error: str | None = None
 
 
 class SceneBeat(BaseModel):
@@ -363,6 +399,7 @@ class TimelineSegment(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     shot_id: str | None = None
+    generation_unit_id: str | None = None
     scene_id: str | None = None
     start_seconds: float
     duration_seconds: float
@@ -556,7 +593,7 @@ class UserInput(BaseModel):
     primary_characters: list[PrimaryCharacterInput] = Field(default_factory=list)
     primary_character_hints: list[PrimaryCharacterHint] = Field(default_factory=list)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
-    quality_preset: Literal["draft", "standard", "high"] = "standard"
+    quality_preset: QualityPreset = "standard"
 
     @model_validator(mode="after")
     def _validate_story_and_characters(self) -> UserInput:
@@ -599,9 +636,11 @@ class PipelineState(BaseModel):
     status: PipelineStatus = "idle"
     current_stage: str = "character_proposal"
     user_input: UserInput
+    quality_preset: QualityPreset = "standard"
     characters: CharacterStore = Field(default_factory=CharacterStore)
     story: Story | None = None
     shot_plan: ShotPlan | None = None
+    generation_units: list[GenerationUnit] = Field(default_factory=list)
     timeline_plan: TimelinePlan | None = None
     total_cost: CostRecord = Field(default_factory=CostRecord)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
@@ -609,6 +648,12 @@ class PipelineState(BaseModel):
     stage_history: list[StageRecord] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def _migrate_quality_preset(self) -> PipelineState:
+        if "quality_preset" not in self.model_fields_set:
+            self.quality_preset = self.user_input.quality_preset
+        return self
 
 
 # --------------------------------------------------------------

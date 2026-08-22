@@ -1,18 +1,21 @@
-"""
-Mock Pipeline Test — 不调用任何真实 API，零成本测试整条 pipeline 逻辑。
-
-测试策略：
-  - 用 MockAnthropicClient 替换 AsyncAnthropic，返回预定义 JSON
-  - 用 stub 替换 image_gen / video_gen / tts_gen / ffmpeg
-  - 用 AutoResolver 跳过所有 checkpoint 交互
-  - 运行完整 run_pipeline()，检查每个阶段的 state
-
-运行方式:
-  cd backend
-  .venv/bin/python -m pytest test_pipeline_mock.py -v
-  # 或直接运行:
-  .venv/bin/python test_pipeline_mock.py
-"""
+# ==============================================================
+# End-to-End Pipeline Smoke Test
+#
+# Runs the orchestration layer with mocked providers and file outputs.
+#
+# Test strategy:
+#   - Replace LLM calls with deterministic mock responses
+#   - Stub image, video, TTS, and ffmpeg work so the run stays offline
+#   - Use automatic checkpoint resolution to avoid interactive prompts
+#   - Exercise the full pipeline and assert that each stage reaches the
+#     expected state transitions and artifacts
+#
+# Usage:
+#   cd backend
+#   .venv/bin/python -m pytest test_pipeline_mock.py -v
+#   # or run directly:
+#   .venv/bin/python test_pipeline_mock.py
+# ==============================================================
 from __future__ import annotations
 
 import asyncio
@@ -24,10 +27,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-# ── 路径设置 ────────────────────────────────────────────────────────────────
+# ── Path setup ──────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
-# ── 预定义的假 Claude 响应 ──────────────────────────────────────────────────
+# ── Predefined mock Claude responses ─────────────────────────────────────────
 
 CHAR_ID_1 = str(uuid.uuid4())
 CHAR_ID_2 = str(uuid.uuid4())
@@ -152,7 +155,7 @@ MOCK_TTS_SCRIPT = json.dumps([
     {"character_id": CHAR_ID_2, "text": "Someone you shouldn't know.", "ssml": "Someone you shouldn't know.", "pause_before_ms": 500, "voice_hint": ""},
 ])
 
-# 按 agent 名字返回不同的 mock 响应
+# Return different mock responses by agent name
 AGENT_MOCK_RESPONSES: dict[str, str] = {
     "character-proposal": MOCK_CHARACTER_PROPOSAL,
     "story-generation": MOCK_STORY,
@@ -164,15 +167,15 @@ AGENT_MOCK_RESPONSES: dict[str, str] = {
 }
 
 
-# ── Mock Anthropic 客户端 ───────────────────────────────────────────────────
+# ── Mock Anthropic client ───────────────────────────────────────────────────
 
 def make_mock_anthropic_client(agent_responses: dict[str, str] = AGENT_MOCK_RESPONSES):
     """
-    创建假的 AsyncAnthropic client。
-    通过 system_prompt 开头内容匹配 agent（每个 agent 的 system_prompt 都以唯一短语开头）。
+    Create a fake AsyncAnthropic client.
+    Match agent by the start of the system_prompt (each agent's system_prompt begins with a unique phrase).
     """
-    # 用 system_prompt 开头的前 80 个字符唯一确定 agent
-    # 这些字符串来自 agent_definitions.py 每个 agent 的 system_prompt 第一句
+    # Use the first ~80 characters of the system_prompt to uniquely identify the agent
+    # These prefixes are taken from the first line of each agent's system_prompt in agent_definitions.py
     SYSTEM_PROMPT_PREFIXES: dict[str, str] = {
         "character-proposal":   "you are a character design specialist",
         "story-generation":     "you are a narrative writer",
@@ -195,13 +198,13 @@ def make_mock_anthropic_client(agent_responses: dict[str, str] = AGENT_MOCK_RESP
         _call_count["n"] += 1
         call_n = _call_count["n"]
 
-        # 匹配 agent：用 system_prompt 开头匹配
+        # Match agent by checking the system_prompt prefix
         matched_agent = None
         for agent_name, prefix in SYSTEM_PROMPT_PREFIXES.items():
             if system_prompt.startswith(prefix):
                 matched_agent = agent_name
                 break
-        # 如果开头没匹配到，用 contains 宽松匹配
+        # If no prefix match, fall back to a looser contains match
         if matched_agent is None:
             for agent_name, prefix in SYSTEM_PROMPT_PREFIXES.items():
                 if prefix in system_prompt[:200]:
@@ -217,7 +220,7 @@ def make_mock_anthropic_client(agent_responses: dict[str, str] = AGENT_MOCK_RESP
 
         response_text = agent_responses.get(matched_agent, "{}")
 
-        # 特殊处理 prompt 相关 agent：动态提取真实 IDs
+        # Special handling for prompt-related agents: dynamically inject real IDs
         if matched_agent == "shot-planning" and user_prompt:
             try:
                 scene_ids = [SCENE_ID_1, SCENE_ID_2, SCENE_ID_3]
@@ -296,12 +299,12 @@ def make_mock_anthropic_client(agent_responses: dict[str, str] = AGENT_MOCK_RESP
     return client
 
 
-# ── Mock 工具函数 ────────────────────────────────────────────────────────────
+# ── Mock helper functions ─────────────────────────────────────────────────────
 
 async def mock_generate_character_images(
     candidates, quality_preset="standard", budget_mode="balanced"
 ):
-    """返回带 placeholder 图片 URL 的候选人物列表。"""
+    """Return a list of candidate characters with placeholder image URLs."""
     print(f"  [mock] generate_character_images input types: {[type(c).__name__ for c in candidates]}")
     result = []
     for i, c in enumerate(candidates):
@@ -393,11 +396,11 @@ async def mock_compose_video(state):
     return path, zero_cost()
 
 
-# ── 测试主体 ─────────────────────────────────────────────────────────────────
+# ── Test runner ──────────────────────────────────────────────────────────────
 
 async def run_mock_pipeline():
     print("\n" + "="*60)
-    print("  Mock Pipeline Test — 零 API 成本")
+    print("  Mock Pipeline Test — zero API cost")
     print("="*60 + "\n")
 
     from anime_pipeline.checkpoint_system import AutoResolver
@@ -463,9 +466,9 @@ async def run_mock_pipeline():
         results["traceback"] = traceback.format_exc()
         print(f"\n❌ Pipeline exception:\n{results['traceback']}")
 
-    # ── 结果检查 ──────────────────────────────────────────────────────────────
+    # ── Result checks ────────────────────────────────────────────────────────
     print("\n" + "="*60)
-    print("  检查结果")
+    print("  Check Results")
     print("="*60)
 
     passed = 0
@@ -486,49 +489,49 @@ async def run_mock_pipeline():
 
     state = results["final_state"]
 
-    # 基本状态检查
-    check("Pipeline 完成", state.status in ("completed", "failed"), state.status)
-    check("Pipeline 未崩溃", state.status != "error", state.status)
+    # Basic state checks
+    check("Pipeline completed", state.status in ("completed", "failed"), state.status)
+    check("Pipeline did not crash", state.status != "error", state.status)
 
-    # 角色
-    check("锁定了人物", len(state.characters.locked) > 0,
-          f"{len(state.characters.locked)} 人物")
+    # Characters
+    check("Characters locked", len(state.characters.locked) > 0,
+          f"{len(state.characters.locked)} characters")
     check(
-        "主角色生成了参考包",
+        "Primary characters generated reference packs",
         all(c.reference_pack.views for c in state.characters.locked),
         f"{sum(len(c.reference_pack.views) for c in state.characters.locked)} refs",
     )
 
-    # 故事
+    # Story
     has_story = state.story is not None
-    check("生成了故事", has_story)
+    check("Story generated", has_story)
     if has_story:
-        check("故事有标题", bool(state.story.title), state.story.title)
-        check("故事有 genre", len(state.story.genre) > 0, str(state.story.genre))
-        check("故事有 synopsis", len(state.story.synopsis) > 20)
-        check("故事有场景", len(state.story.scenes) > 0,
-              f"{len(state.story.scenes)} 场景")
+        check("Story has title", bool(state.story.title), state.story.title)
+        check("Story has genre", len(state.story.genre) > 0, str(state.story.genre))
+        check("Story has synopsis", len(state.story.synopsis) > 20)
+        check("Story has scenes", len(state.story.scenes) > 0,
+              f"{len(state.story.scenes)} scenes")
 
-    # 场景
+    # Scenes
     if has_story and state.story.scenes:
         scenes = state.story.scenes
-        check("每个场景有 index", all(hasattr(s, "index") for s in scenes))
-        check("每个场景有 title", all(bool(s.title) for s in scenes))
-        check("每个场景有 location", all(bool(s.location) for s in scenes))
-        check("生成了 shot plan", state.shot_plan is not None)
+        check("Every scene has index", all(hasattr(s, "index") for s in scenes))
+        check("Every scene has title", all(bool(s.title) for s in scenes))
+        check("Every scene has location", all(bool(s.location) for s in scenes))
+        check("Shot plan generated", state.shot_plan is not None)
         if state.shot_plan is not None:
-            check("shot plan 有镜头", len(state.shot_plan.shots) > 0, f"{len(state.shot_plan.shots)} shots")
+            check("Shot plan has shots", len(state.shot_plan.shots) > 0, f"{len(state.shot_plan.shots)} shots")
             check(
-                "shot plan 已生成 prompts",
+                "Shot plan has generation prompts",
                 all(bool(shot.generation_prompt) for shot in state.shot_plan.shots),
             )
 
-        # 检查生成阶段的输出
+        # Check generation outputs
         scenes_with_output = [s for s in scenes if s.output is not None]
-        check("场景有生成输出", len(scenes_with_output) > 0,
-              f"{len(scenes_with_output)}/{len(scenes)} 有输出")
+        check("Scenes have generated output", len(scenes_with_output) > 0,
+              f"{len(scenes_with_output)}/{len(scenes)} have output")
 
-    # 阶段记录
+    # Stage history
     completed_stages = [s.stage for s in state.stage_history if s.status == "completed"]
     expected_stages = [
         "character_proposal", "reference_pack_generation", "story_generation", "scene_breakdown",
@@ -537,15 +540,15 @@ async def run_mock_pipeline():
         "generation", "tts_audio", "video_composition",
     ]
     for stage in expected_stages:
-        check(f"阶段完成: {stage}", stage in completed_stages)
+        check(f"Stage completed: {stage}", stage in completed_stages)
 
-    # 成本
-    check("成本在预算内",
-          state.total_cost.total_cost_usd <= 10.0,
-          f"${state.total_cost.total_cost_usd:.4f}")
+        # Cost
+        check("Cost within budget",
+            state.total_cost.total_cost_usd <= 10.0,
+            f"${state.total_cost.total_cost_usd:.4f}")
 
     print(f"\n{'='*60}")
-    print(f"  结果: {passed} 通过, {failed} 失败")
+    print(f"  Results: {passed} passed, {failed} failed")
     print(f"{'='*60}\n")
 
     return failed == 0

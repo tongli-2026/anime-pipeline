@@ -44,6 +44,7 @@ dev = [
 [project.scripts]
 anime-pipeline = "anime_pipeline.main:main"
 anime-pipeline-shot = "anime_pipeline.shot_cli:main"
+anime-pipeline-sequence = "anime_pipeline.sequence_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["anime_pipeline"]

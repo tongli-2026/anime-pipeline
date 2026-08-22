@@ -1,15 +1,34 @@
-# ==============================================================
+# =================================================================================
 # Tool: Image & Video Generation
 #
-# Real API implementations:
-#   - Image: fal.ai (Flux / SDXL)  — async, fast, anime-friendly
-#   - Video: Seedance / Kling via fal.ai, or Runway Gen-3
+# Provides synchronous/async helpers to produce still images, keyframes,
+# character reference packs, and short motion clips. This module centralizes
+# provider selection, durable download/normalization, and conservative cost
+# accounting for image/video generations.
 #
-# Fallback chain: fal.ai → Replicate → stub (for offline dev)
+# Providers (preferred order depends on `budget_mode` and `quality_preset`):
+#   - `fal` (fal.ai / Flux / Seedance) — fast, anime-friendly, budget-friendly
+#   - `openai` (GPT Image 2 / edits)  — balanced/quality image generation
+#   - `replicate` (SDXL fallback)
 #
-# All API keys are read lazily from env.get_config() so that
-# dotenv has time to load before any key is accessed.
-# ==============================================================
+# Provider selection rules:
+#   - `budget_mode == "budget"` favors `fal` and avoids silently falling back
+#     to more expensive billable providers.
+#   - High `quality_preset` prefers `openai` where available for image fidelity.
+#   - Image edits that use a reference will choose the provider that supports
+#     reference-guided edits first (OpenAI/FAL), then fall back to text-only.
+#
+# Key behaviors:
+#   - Normalizes generated images to cinematic 16:9 canvases for composition.
+#   - Produces Ken-Burns-ready keyframes and can upload local files to fal.ai
+#     when an image-to-video provider requires hosted URLs.
+#   - Downloads generated assets to `output/images` and `output/videos`.
+#   - Conservative cost estimates are returned alongside generated assets.
+#
+# Notes:
+#   - API keys are read lazily from `get_config()` so dotenv can load in `main`.
+#   - Network calls use `httpx` and some provider SDKs run in a thread pool.
+# =================================================================================
 
 from __future__ import annotations
 
@@ -18,10 +37,12 @@ import base64
 import hashlib
 import io
 import logging
+import math
 import re
 import shutil
 import time
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,10 +58,14 @@ from ..models import (
     CharacterReferencePack,
     CostRecord,
     LockedCharacter,
+    QualityPreset,
+    ReferenceGenerationStrategy,
+    ReferenceViewType,
     Scene,
     Shot,
     VideoProvider,
 )
+from ..quality import VideoResolution, get_quality_profile
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +75,27 @@ VIDEO_OUTPUT_DIR = Path("./output/videos")
 SEEDANCE_TEXT_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"
 SEEDANCE_IMAGE_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/image-to-video"
 DEFAULT_VIDEO_CLIP_SECONDS = 5.0
+SEEDANCE_MIN_DURATION_SECONDS = 4
+SEEDANCE_MAX_DURATION_SECONDS = 12
 ImageProvider = Literal["openai", "fal", "replicate"]
 ImagePurpose = Literal["default", "keyframe", "reference"]
 BudgetMode = Literal["budget", "balanced", "quality"]
 ReferenceTransformation = Literal["identity", "pose", "expression"]
-DEFAULT_REFERENCE_VIEWS = (
+DEFAULT_REFERENCE_VIEWS: tuple[ReferenceViewType, ...] = (
     "portrait_three_quarter",
     "full_body_front",
     "expression_sheet",
 )
+
+
+@dataclass(frozen=True)
+class PromptLintIssue:
+    """A warning emitted before a prompt is sent to a provider."""
+
+    rule_id: str
+    severity: Literal["warning", "high"]
+    message: str
+    excerpt: str
 
 
 def _artifact_id(value: str) -> str:
@@ -68,33 +105,15 @@ def _artifact_id(value: str) -> str:
     return f"{readable}-{digest}"
 
 
-def _resolve_image_provider(purpose: ImagePurpose, budget_mode: BudgetMode) -> ImageProvider:
-    """Resolve the preferred image provider from cost mode and balanced-mode config."""
-    if budget_mode == "budget":
+def _resolve_image_provider(
+    purpose: ImagePurpose,  # noqa: ARG001 - retained for call-site readability
+    budget_mode: BudgetMode,
+    quality_preset: QualityPreset,
+) -> ImageProvider:
+    """Resolve the preferred image provider from the selected cost/quality mode."""
+    if quality_preset == "draft" or budget_mode == "budget":
         return "fal"
-    if budget_mode == "quality":
-        return "openai"
-
-    cfg = get_config()
-    configured = {
-        "default": cfg.image_provider_default,
-        "keyframe": cfg.image_provider_keyframe,
-        "reference": cfg.image_provider_reference,
-    }[purpose].strip().lower()
-    if configured == "openai":
-        return "openai"
-    if configured == "fal":
-        return "fal"
-    if configured == "replicate":
-        return "replicate"
-
-    fallback: dict[ImagePurpose, ImageProvider] = {
-        "default": "fal",
-        "keyframe": "openai",
-        "reference": "fal",
-    }
-    logger.warning("Invalid image provider %r for %s; using %s", configured, purpose, fallback[purpose])
-    return fallback[purpose]
+    return "openai"
 
 
 def _require_url(value: Any, provider: str) -> str:
@@ -107,6 +126,264 @@ def _seedance_api_key(config: Any) -> str:
     """Use a dedicated Seedance fal.ai credential when configured."""
     key = getattr(config, "seedance_api_key", "") or config.fal_key
     return key if isinstance(key, str) else ""
+
+
+def _sanitize_visual_prompt(prompt: str) -> str:
+    """Remove non-visual and safety-sensitive wording from image/video prompts."""
+    sanitized = prompt
+    sanitized = re.sub(
+        r"\b(?:Her|His|Their)\s+speaking voice should[^.]*\.",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r"\b(?:voice should|TTS delivery|OpenAI TTS delivery)[^.]*\.",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    replacements = {
+        r"\b16-year-old girl\b": "high-school-aged girl",
+        r"\b17-year-old transfer student\b": "high-school-aged transfer student",
+        r"\bteenage girl\b": "high-school-aged girl",
+        r"\bteenage or young adult\b": "young adult",
+        r"\bfrom her chest and body\b": "around her shoulders",
+        r"\bfrom his chest and body\b": "around his shoulders",
+        r"\bfrom her chest and shoulders\b": "around her shoulders",
+        r"\bfrom her chest and throat\b": "around her shoulders",
+        r"\bfrom her chest\b": "around her shoulders",
+        r"\bfrom her throat\b": "around her shoulders",
+        r"\bfrom her body\b": "around her",
+        r"\berupting from her body\b": "flaring around her",
+        r"\berupt from her body\b": "flare around her",
+        r"\berupting from her chest\b": "spiraling around her shoulders",
+        r"\berupt from her chest\b": "spiral around her shoulders",
+        r"\bdeep red ribbons erupt from her chest and throat\b": "deep red ribbons swirl around her shoulders",
+        r"\bdeep red ribbons erupting from her chest and throat\b": "deep red ribbons swirling around her shoulders",
+        r"\bviolent\b": "intense",
+        r"\bviolently\b": "intensely",
+        r"\bexposed\b": "revealed",
+    }
+    for pattern, replacement in replacements.items():
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"[ \t]+", " ", sanitized)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+    guardrail = (
+        "Fully clothed, non-sexual character design, modest school uniform, "
+        "focus on facial emotion and supernatural ribbons."
+    )
+    if "non-sexual character design" not in sanitized.lower():
+        sanitized = f"{sanitized}\n\n{guardrail}"
+    return sanitized
+
+
+def _prompt_excerpt(prompt: str, match_start: int, match_end: int, window: int = 80) -> str:
+    start = max(0, match_start - window)
+    end = min(len(prompt), match_end + window)
+    excerpt = prompt[start:end].strip()
+    if start > 0:
+        excerpt = f"…{excerpt}"
+    if end < len(prompt):
+        excerpt = f"{excerpt}…"
+    return excerpt.replace("\n", " ")
+
+
+def _lint_provider_prompt(prompt: str) -> list[PromptLintIssue]:
+    """Flag prompt combinations that are likely to trigger moderation or poor fidelity."""
+    issues: list[PromptLintIssue] = []
+    text = prompt.strip()
+    if not text:
+        return issues
+    layout_scan_text = re.sub(
+        r"(?is)do not create a storyboard, sequence sheet, split-screen image, stacked frames, "
+        r"multiple panels, contact sheet, collage, before/after comparison, captioned layout, "
+        r"grid, or bordered composition\.?",
+        "",
+        text,
+    )
+
+    def add_match(
+        rule_id: str,
+        severity: Literal["warning", "high"],
+        message: str,
+        pattern: str,
+        *,
+        flags: int = re.IGNORECASE,
+        scan_text: str = text,
+    ) -> None:
+        match = re.search(pattern, scan_text, flags)
+        if match:
+            issues.append(
+                PromptLintIssue(
+                    rule_id=rule_id,
+                    severity=severity,
+                    message=message,
+                    excerpt=_prompt_excerpt(scan_text, match.start(), match.end()),
+                )
+            )
+
+    add_match(
+        "voice-in-visual-prompt",
+        "warning",
+        "Voice direction or TTS wording is present in a visual prompt.",
+        r"\b(?:speaking voice should|voice should|tts delivery|openai tts delivery|voice profile)\b",
+    )
+    add_match(
+        "layout-structure",
+        "warning",
+        "Storyboard/layout language may confuse image or video generation.",
+        r"\b(?:storyboard|split[- ]screen|stacked frames|contact sheet|collage|sequence sheet|grid)\b",
+        flags=re.IGNORECASE,
+        scan_text=layout_scan_text,
+    )
+    add_match(
+        "sexualized-language",
+        "high",
+        "Potentially sexualized or exposure-related wording was found.",
+        r"\b(?:exposed|nude|naked|lingerie|underwear|see-through|bare skin)\b",
+    )
+
+    age_terms = re.search(r"\b(?:16|17|teenage|high-school-aged)\b", text, re.IGNORECASE)
+    body_terms = re.search(
+        r"\b(?:chest|throat|body|torso|breasts|hips|waist)\b",
+        text,
+        re.IGNORECASE,
+    )
+    motion_terms = re.search(
+        r"\b(?:erupt(?:ing)?|burst(?:ing)?|spray(?:ing)?|spill(?:ing)?|pour(?:ing)?|flare(?:ing)?|surge(?:ing)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if age_terms and body_terms and motion_terms:
+        issues.append(
+            PromptLintIssue(
+                rule_id="young-character-body-eruption",
+                severity="high",
+                message=(
+                    "Young-character + body-part + eruption wording is a common moderation trigger."
+                ),
+                excerpt=_prompt_excerpt(
+                    text,
+                    min(age_terms.start(), body_terms.start(), motion_terms.start()),
+                    max(age_terms.end(), body_terms.end(), motion_terms.end()),
+                ),
+            )
+        )
+    elif body_terms and motion_terms:
+        issues.append(
+            PromptLintIssue(
+                rule_id="body-eruption",
+                severity="high",
+                message=(
+                    "Body-part + eruption wording can look sexualized or invasive to providers."
+                ),
+                excerpt=_prompt_excerpt(
+                    text,
+                    min(body_terms.start(), motion_terms.start()),
+                    max(body_terms.end(), motion_terms.end()),
+                ),
+            )
+        )
+
+    if layout_scan_text != text:
+        issues = [
+            issue
+            for issue in issues
+            if issue.rule_id != "layout-structure"
+            or re.search(
+                r"\b(?:storyboard|split[- ]screen|stacked frames|contact sheet|collage|sequence sheet|grid)\b",
+                layout_scan_text,
+                re.IGNORECASE,
+            )
+            is not None
+        ]
+
+    if any(issue.rule_id == "layout-structure" for issue in issues):
+        if re.search(r"\bexpression sheet\b", text, re.IGNORECASE) and re.search(
+            r"\b(?:facial expressions?|expressions?)\b", text, re.IGNORECASE
+        ):
+            issues = [issue for issue in issues if issue.rule_id != "layout-structure"]
+
+    return issues
+
+
+def _log_provider_prompt_lint(provider_label: str, prompt: str) -> list[PromptLintIssue]:
+    """Run prompt lint before a provider request is sent, without noisy console warnings."""
+    issues = _lint_provider_prompt(prompt)
+    if issues and logger.isEnabledFor(logging.DEBUG):
+        for issue in issues:
+            logger.debug(
+                "%s prompt lint [%s/%s]: %s | %s",
+                provider_label,
+                issue.rule_id,
+                issue.severity,
+                issue.message,
+                issue.excerpt,
+            )
+    return issues
+
+
+def _build_visual_character_anchor(shot_character: Any) -> str:
+    """Build a visual-only character anchor for image/video prompts."""
+    parts: list[str] = []
+    name = getattr(shot_character, "character_name", None) or getattr(
+        shot_character, "character_id", ""
+    )
+    prompt_base = getattr(shot_character, "prompt_base", "") or ""
+    if name and prompt_base:
+        parts.append(f"{name}: {prompt_base}")
+    elif prompt_base:
+        parts.append(prompt_base)
+    state = getattr(shot_character, "state", None)
+    if state is not None:
+        visual_state_bits = []
+        for label, value in (
+            ("expression", getattr(state, "expression", "")),
+            ("action", getattr(state, "action", "")),
+            ("outfit", getattr(state, "outfit", "")),
+        ):
+            if value:
+                visual_state_bits.append(f"{label} {value}")
+        facing = getattr(shot_character, "facing", None)
+        if facing:
+            visual_state_bits.append(f"facing {facing}")
+        eyeline_target = getattr(shot_character, "eyeline_target", None)
+        if eyeline_target:
+            visual_state_bits.append(f"eyeline {eyeline_target}")
+        if visual_state_bits:
+            parts.append(", ".join(visual_state_bits))
+    continuity_notes = getattr(shot_character, "continuity_notes", None) or []
+    if continuity_notes:
+        parts.append("continuity: " + ", ".join(continuity_notes))
+    return _sanitize_visual_prompt("; ".join(part for part in parts if part))
+
+
+def _compact_provider_prompt(prompt: str, max_chars: int = 2400) -> str:
+    """Keep provider prompts under strict API limits while preserving the lead."""
+    sanitized = _sanitize_visual_prompt(prompt)
+    paragraphs = [part.strip() for part in sanitized.split("\n\n") if part.strip()]
+    compact = "\n\n".join(
+        part
+        for part in paragraphs
+        if not part.lower().startswith(
+            (
+                "preserve these character anchors",
+                "continuity anchors",
+                "character continuity anchors",
+            )
+        )
+    )
+    if len(compact) <= max_chars:
+        return compact
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 120].rsplit(".", 1)[0].strip() + "."
+    if "non-sexual character design" not in compact.lower():
+        compact = (
+            f"{compact}\n\nFully clothed, non-sexual character design, "
+            "modest school uniform."
+        )
+    return compact
 
 
 def _make_kling_jwt(access_key: str, secret_key: str) -> str:
@@ -146,7 +423,7 @@ def _select_reference_image_for_shot(shot: Shot, character_direction: Any) -> st
     return reference_image if isinstance(reference_image, str) else None
 
 
-def _reference_pack_specs() -> list[tuple[str, str, str, str]]:
+def _reference_pack_specs() -> list[tuple[ReferenceViewType, ReferenceGenerationStrategy, str, str]]:
     """Default production-oriented views and generation strategies for a new main character."""
     return [
         (
@@ -208,7 +485,7 @@ def _reference_pack_specs() -> list[tuple[str, str, str, str]]:
 
 def _starter_reference_pack_specs(
     existing_view_types: Collection[str] | None = None,
-) -> list[tuple[str, str, str, str]]:
+) -> list[tuple[ReferenceViewType, ReferenceGenerationStrategy, str, str]]:
     """Return the minimum useful starter pack, excluding already available views."""
     existing = existing_view_types or set()
     specs_by_view = {spec[0]: spec for spec in _reference_pack_specs()}
@@ -247,6 +524,24 @@ async def _materialize_image(source: str, dest: Path, client: httpx.AsyncClient)
     return dest
 
 
+def _normalize_cinematic_image(path: Path, quality_preset: QualityPreset) -> Path:
+    """Center-crop a generated scene/keyframe image to the profile's 16:9 canvas."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return path
+
+    from PIL import Image, ImageOps
+
+    profile = get_quality_profile(quality_preset)
+    with Image.open(path) as source:
+        normalized = ImageOps.fit(
+            source.convert("RGB"),
+            (profile.width, profile.height),
+            method=Image.Resampling.LANCZOS,
+        )
+        normalized.save(path, format="PNG", optimize=True)
+    return path
+
+
 # ======================================================================
 # IMAGE GENERATION
 # ======================================================================
@@ -259,17 +554,19 @@ async def _call_fal_image(
 ) -> str:
     """Call fal.ai Flux for image generation using new SDK. Returns image URL."""
     cfg = get_config()
-    
+    _log_provider_prompt_lint("fal image", prompt)
+
     # Import fal_client SDK
     import os
 
     import fal_client as fal
-    
+
     # Set FAL_KEY via environment variable (required by new SDK)
     os.environ["FAL_KEY"] = cfg.fal_key
-    
+    prompt = _sanitize_visual_prompt(prompt)
+
     steps = 35 if quality == "hd" else 20
-    
+
     # Use fal.subscribe which handles polling internally
     # Run in thread pool since it's blocking/synchronous
     result = await asyncio.to_thread(
@@ -303,12 +600,14 @@ async def _call_fal_image_to_image(
 ) -> str:
     """Call fal.ai FLUX image-to-image using a reference image."""
     cfg = get_config()
+    _log_provider_prompt_lint("fal image-to-image", prompt)
 
     import os
 
     import fal_client as fal
 
     os.environ["FAL_KEY"] = cfg.fal_key
+    prompt = _sanitize_visual_prompt(prompt)
 
     strength_by_transformation = {
         "identity": 0.62 if quality == "hd" else 0.7,
@@ -369,9 +668,10 @@ async def _call_openai_image(
     from openai import AsyncOpenAI
 
     cfg = get_config()
+    _log_provider_prompt_lint("openai image", prompt)
     response = await AsyncOpenAI(api_key=cfg.openai_api_key).images.generate(
         model="gpt-image-2",
-        prompt=prompt,
+        prompt=_sanitize_visual_prompt(prompt),
         size="1536x1024",
         quality="high" if quality == "hd" else "medium",
         output_format="png",
@@ -394,6 +694,7 @@ async def _call_openai_image_edit(
     """Edit from a character reference using GPT Image 2."""
     from openai import AsyncOpenAI
 
+    _log_provider_prompt_lint("openai image-edit", prompt)
     if reference_image.startswith("http"):
         download_response = await client.get(
             reference_image,
@@ -410,7 +711,7 @@ async def _call_openai_image_edit(
     edit_response = await AsyncOpenAI(api_key=cfg.openai_api_key).images.edit(
         model="gpt-image-2",
         image=image_file,
-        prompt=prompt,
+        prompt=_sanitize_visual_prompt(prompt),
         size="1536x1024",
         quality="high" if quality == "hd" else "medium",
         output_format="png",
@@ -431,6 +732,8 @@ async def _call_replicate_image(
 ) -> str:
     """Fallback: Replicate SDXL for image generation."""
     cfg = get_config()
+    _log_provider_prompt_lint("replicate image", prompt)
+    prompt = _sanitize_visual_prompt(prompt)
     payload = {
         "version": "39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
         "input": {
@@ -604,21 +907,40 @@ def _video_provider_order(
 
 def _billable_video_duration(provider: BillableVideoProvider, requested_seconds: float) -> float:
     """Match cost accounting to the clip duration sent to each provider."""
-    if provider in ("seedance", "kling"):
-        return DEFAULT_VIDEO_CLIP_SECONDS
+    if provider == "seedance":
+        return float(_seedance_video_duration(requested_seconds))
+    if provider == "kling":
+        return float(_kling_video_duration(requested_seconds))
     return 10.0 if requested_seconds > DEFAULT_VIDEO_CLIP_SECONDS else DEFAULT_VIDEO_CLIP_SECONDS
+
+
+def _seedance_video_duration(requested_seconds: float) -> int:
+    """Round up and clamp a requested duration to Seedance 1.5's supported range."""
+    return min(
+        SEEDANCE_MAX_DURATION_SECONDS,
+        max(SEEDANCE_MIN_DURATION_SECONDS, math.ceil(requested_seconds)),
+    )
+
+
+def _kling_video_duration(requested_seconds: float) -> int:
+    """Select the smallest Kling duration tier that covers the requested clip."""
+    return 10 if requested_seconds > DEFAULT_VIDEO_CLIP_SECONDS else 5
 
 
 async def _call_seedance_video(
     prompt: str,
+    duration_seconds: float,
     client: httpx.AsyncClient,  # noqa: ARG001 - kept for provider API consistency
+    resolution: VideoResolution = "720p",
 ) -> str:
-    """Generate a five-second 720p Seedance clip without redundant native audio."""
+    """Generate a 4-12 second 720p Seedance clip without redundant native audio."""
     import os
 
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_lint("seedance video", prompt)
+    prompt = _compact_provider_prompt(prompt)
     os.environ["FAL_KEY"] = _seedance_api_key(cfg)
     result = await asyncio.to_thread(
         fal.subscribe,
@@ -626,8 +948,8 @@ async def _call_seedance_video(
         arguments={
             "prompt": prompt,
             "aspect_ratio": "16:9",
-            "resolution": "720p",
-            "duration": "5",
+            "resolution": resolution,
+            "duration": str(_seedance_video_duration(duration_seconds)),
             "enable_safety_checker": True,
             "generate_audio": False,
         },
@@ -650,11 +972,11 @@ async def _call_kling_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_lint("kling video", prompt)
     os.environ["FAL_KEY"] = cfg.fal_key
+    prompt = _compact_provider_prompt(prompt, 2400)
 
-    # fal.ai only supports 5s or 10s. Always use 5s to control costs.
-    # (scene duration_seconds from Claude can be 20-30s, but we cap video at 5s clip)
-    kling_duration = "5"
+    kling_duration = str(_kling_video_duration(duration_seconds))
     # Use Kling 1.6 std (budget) or pro (hd) via fal.ai
     if quality == "hd":
         model_id = "fal-ai/kling-video/v1.6/pro/text-to-video"
@@ -683,7 +1005,9 @@ async def _call_runway_video(
 ) -> str:
     """Generate video via Runway Gen-3 Alpha Turbo API."""
     cfg = get_config()
+    _log_provider_prompt_lint("runway video", prompt)
     runway_duration = 10 if duration_seconds > 5.0 else 5
+    prompt = _compact_provider_prompt(prompt)
 
     payload = {
         "promptText": prompt,
@@ -735,6 +1059,7 @@ async def _call_video_api(
     negative_prompt: str | None = None,
     video_provider: VideoProvider = "auto",
     budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
+    video_resolution: VideoResolution = "720p",
 ) -> tuple[str, CostRecord]:
     video_url, cost, _ = await _call_video_api_with_provider(
         prompt,
@@ -743,6 +1068,7 @@ async def _call_video_api(
         negative_prompt,
         video_provider,
         budget_mode,
+        video_resolution,
     )
     return video_url, cost
 
@@ -754,6 +1080,7 @@ async def _call_video_api_with_provider(
     negative_prompt: str | None = None,
     video_provider: VideoProvider = "auto",
     budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
+    video_resolution: VideoResolution = "720p",
 ) -> tuple[str, CostRecord, BillableVideoProvider | None]:
     """
     Generate a video clip and report the provider that actually handled it.
@@ -765,6 +1092,7 @@ async def _call_video_api_with_provider(
     effective_prompt = prompt
     if negative_prompt:
         effective_prompt = f"{prompt}\n\nAvoid: {negative_prompt}"
+    effective_prompt = _compact_provider_prompt(effective_prompt)
 
     async with httpx.AsyncClient() as client:
         for provider in _video_provider_order(video_provider, budget_mode):
@@ -779,7 +1107,12 @@ async def _call_video_api_with_provider(
 
             try:
                 if provider == "seedance":
-                    video_url = await _call_seedance_video(effective_prompt, client)
+                    video_url = await _call_seedance_video(
+                        effective_prompt,
+                        duration_seconds,
+                        client,
+                        video_resolution,
+                    )
                 elif provider == "kling":
                     video_url = await _call_kling_video(
                         effective_prompt,
@@ -800,6 +1133,7 @@ async def _call_video_api_with_provider(
                     generated_seconds,
                     provider,
                     quality=quality,
+                    resolution=video_resolution,
                 )
                 logger.info("%s video generated: %s", provider.title(), video_url[:80])
                 return video_url, cost, provider
@@ -826,14 +1160,17 @@ async def _call_seedance_image_to_video(
     prompt: str,
     start_image_url: str,
     end_image_url: str | None,
+    duration_seconds: float,
     negative_prompt: str | None = None,
+    resolution: VideoResolution = "720p",
 ) -> tuple[str, CostRecord]:
-    """Generate a five-second Seedance clip using opening and optional ending frames."""
+    """Generate a 4-12 second Seedance clip using opening and optional ending frames."""
     import os
 
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_lint("seedance image-to-video", prompt)
     os.environ["FAL_KEY"] = _seedance_api_key(cfg)
 
     effective_prompt = prompt
@@ -843,8 +1180,8 @@ async def _call_seedance_image_to_video(
         "prompt": effective_prompt,
         "image_url": start_image_url,
         "aspect_ratio": "16:9",
-        "resolution": "720p",
-        "duration": "5",
+        "resolution": resolution,
+        "duration": str(_seedance_video_duration(duration_seconds)),
         "enable_safety_checker": True,
         "generate_audio": False,
     }
@@ -858,9 +1195,11 @@ async def _call_seedance_image_to_video(
     )
     video_url = result["video"]["url"]
     cost = calc_video_cost(
-        DEFAULT_VIDEO_CLIP_SECONDS,
+        _seedance_video_duration(duration_seconds),
         "seedance",
         generation_mode="image_to_video",
+        quality="hd" if resolution == "1080p" else "standard",
+        resolution=resolution,
     )
     return video_url, cost
 
@@ -879,7 +1218,9 @@ async def _call_kling_image_to_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_lint("kling image-to-video", prompt)
     os.environ["FAL_KEY"] = cfg.fal_key
+    prompt = _compact_provider_prompt(prompt, 2400)
 
     model_id = (
         "fal-ai/kling-video/o1/standard/image-to-video"
@@ -889,7 +1230,7 @@ async def _call_kling_image_to_video(
     arguments = {
         "prompt": prompt,
         "start_image_url": start_image_url,
-        "duration": "5",
+        "duration": str(_kling_video_duration(duration_seconds)),
     }
     if end_image_url:
         arguments["end_image_url"] = end_image_url
@@ -903,7 +1244,7 @@ async def _call_kling_image_to_video(
     )
     video_url = result["video"]["url"]
     cost = calc_video_cost(
-        DEFAULT_VIDEO_CLIP_SECONDS,
+        _kling_video_duration(duration_seconds),
         "kling",
         generation_mode="image_to_video",
         quality=quality,
@@ -923,7 +1264,8 @@ async def generate_scene_video(
     budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
 ) -> tuple[str, CostRecord]:
     """Generate a video clip for a key scene. Downloads to local output dir."""
-    quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
+    profile = get_quality_profile(quality_preset)
+    quality = profile.video_quality
     prompt = scene.generation_prompt or scene.description
     video_url, cost = await _call_video_api(
         prompt,
@@ -932,6 +1274,7 @@ async def generate_scene_video(
         scene.negative_prompt,
         video_provider,
         budget_mode,
+        profile.video_resolution,
     )
 
     await _ensure_output_dir(VIDEO_OUTPUT_DIR)
@@ -954,7 +1297,7 @@ async def generate_character_images(
     """Generate preview images for all character candidates in parallel."""
     await _ensure_output_dir(OUTPUT_DIR)
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
-    preferred_provider = _resolve_image_provider("default", budget_mode)
+    preferred_provider = _resolve_image_provider("default", budget_mode, quality_preset)
 
     async with httpx.AsyncClient() as client:
 
@@ -990,7 +1333,7 @@ async def generate_character_reference_pack(
     """Generate a cost-aware three-image starter pack for locked primary characters."""
     await _ensure_output_dir(OUTPUT_DIR)
     quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
-    preferred_provider = _resolve_image_provider("reference", budget_mode)
+    preferred_provider = _resolve_image_provider("reference", budget_mode, quality_preset)
     total_cost = zero_cost()
 
     async with httpx.AsyncClient() as client:
@@ -1088,16 +1431,36 @@ async def generate_scene_image(
 ) -> tuple[str, CostRecord]:
     """Generate a still image for a normal scene and download to local file."""
     await _ensure_output_dir(OUTPUT_DIR)
-    quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
-    preferred_provider = _resolve_image_provider("default", budget_mode)
-    prompt = scene.generation_prompt or scene.description
+    profile = get_quality_profile(quality_preset)
+    quality = profile.image_quality
+    preferred_provider = _resolve_image_provider("default", budget_mode, quality_preset)
+    base_prompt = _sanitize_visual_prompt(scene.generation_prompt or scene.description)
+    prompt = (
+        f"{base_prompt}\n\n"
+        "Render exactly one single full-frame 16:9 cinematic image for this scene. "
+        "Do not create a storyboard, sequence sheet, split-screen image, stacked frames, "
+        "multiple panels, contact sheet, collage, before/after comparison, captioned layout, "
+        "grid, or bordered composition."
+    )
+    negative_prompt = ", ".join(
+        term
+        for term in [
+            scene.negative_prompt,
+            (
+                "storyboard, sequence sheet, grid, split screen, stacked frames, multiple panels, "
+                "manga panels, comic panels, contact sheet, collage, before and after comparison, "
+                "borders, captions"
+            ),
+        ]
+        if term
+    )
 
     async with httpx.AsyncClient() as client:
         image_url, cost = await _call_image_api(
             prompt,
             hash(scene.id) & 0xFFFFFFFF,
             quality,
-            scene.negative_prompt,
+            negative_prompt,
             client,
             preferred_provider=preferred_provider,
         )
@@ -1105,6 +1468,11 @@ async def generate_scene_image(
         file_path = OUTPUT_DIR / f"scene_{_artifact_id(scene.id)}.png"
         try:
             await _materialize_image(image_url, file_path, client)
+            await asyncio.to_thread(
+                _normalize_cinematic_image,
+                file_path,
+                quality_preset,
+            )
         except Exception as exc:
             logger.warning("Failed to persist scene image: %s", exc)
             file_path.touch()
@@ -1123,29 +1491,25 @@ async def generate_shot_hybrid(
     1. Generate opening/ending keyframes as images for continuity anchors
     2. Generate the motion clip using a prompt augmented with keyframe guidance
     """
-    quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
-    preferred_provider = _resolve_image_provider("keyframe", budget_mode)
+    profile = get_quality_profile(quality_preset)
+    quality = profile.image_quality
+    preferred_provider = _resolve_image_provider("keyframe", budget_mode, quality_preset)
     await _ensure_output_dir(OUTPUT_DIR)
     await _ensure_output_dir(VIDEO_OUTPUT_DIR)
 
-    base_prompt = shot.generation_prompt or shot.visual_intent or shot.action_description
-    character_anchors: list[str] = []
-    for char_dir in shot.characters:
-        if not char_dir.prompt_base:
-            continue
-        parts = [f"{char_dir.character_name or char_dir.character_id}: {char_dir.prompt_base}"]
-        parts.append(
-            f"expression {char_dir.state.expression}, action {char_dir.state.action}, "
-            f"outfit {char_dir.state.outfit}, emotion {char_dir.state.emotion}"
-        )
-        if char_dir.continuity_notes:
-            parts.append("continuity: " + ", ".join(char_dir.continuity_notes))
-        character_anchors.append(", ".join(parts))
+    base_prompt = _sanitize_visual_prompt(
+        shot.generation_prompt or shot.visual_intent or shot.action_description
+    )
+    character_anchors = [
+        anchor
+        for anchor in (_build_visual_character_anchor(char_dir) for char_dir in shot.characters)
+        if anchor
+    ]
 
     if character_anchors:
         base_prompt = (
             f"{base_prompt}\n\n"
-            "Preserve these character anchors exactly:\n- "
+            "Character continuity anchors:\n- "
             + "\n- ".join(character_anchors)
         )
     keyframe_paths: dict[str, str] = {}
@@ -1163,6 +1527,7 @@ async def generate_shot_hybrid(
     total_cost = zero_cost()
     keyframe_descriptions: list[str] = []
     metadata: dict[str, Any] = {
+        "continuity_mode": shot.continuity_mode,
         "used_reference_image": False,
         "reference_image_path": None,
         "selected_reference_images": [],
@@ -1191,6 +1556,13 @@ async def generate_shot_hybrid(
                 "Use the reference only for character identity, face, hair, and outfit. "
                 "Follow the requested environment, lighting, staging, and framing."
             )
+            if label == "opening" and shot.keyframes.opening_frame_reference:
+                frame_reference = shot.keyframes.opening_frame_reference
+                reference_instruction = (
+                    "Use the previous shot's ending frame as a continuity reference. Preserve "
+                    "character identity, pose continuity, environment design, lighting, and props, "
+                    "but recompose the camera to match this shot's requested scale and angle."
+                )
             if label == "ending" and keyframe_paths.get("opening"):
                 frame_reference = keyframe_paths["opening"]
                 reference_instruction = (
@@ -1202,6 +1574,10 @@ async def generate_shot_hybrid(
             image_prompt = (
                 f"{base_prompt}\n\n"
                 f"{label.title()} keyframe intent: {keyframe_prompt}\n\n"
+                "Render exactly one single full-frame 16:9 cinematic image for this "
+                "keyframe. Do not create a storyboard, split-screen image, stacked "
+                "frames, multiple panels, contact sheet, collage, before/after comparison, "
+                "captioned layout, or bordered composition.\n\n"
                 f"Reference instructions: {reference_instruction}"
             )
             if frame_reference:
@@ -1228,6 +1604,11 @@ async def generate_shot_hybrid(
             file_path = OUTPUT_DIR / f"shot_{_artifact_id(shot.id)}_{label}.png"
             try:
                 await _materialize_image(image_url, file_path, client)
+                await asyncio.to_thread(
+                    _normalize_cinematic_image,
+                    file_path,
+                    quality_preset,
+                )
             except Exception as exc:
                 logger.warning("Failed to persist %s keyframe: %s", label, exc)
                 file_path.touch()
@@ -1264,7 +1645,9 @@ async def generate_shot_hybrid(
                     hybrid_prompt,
                     start_url,
                     end_url,
+                    shot.duration_seconds,
                     shot.negative_prompt,
+                    profile.video_resolution,
                 )
             else:
                 video_url, video_cost = await _call_kling_image_to_video(
@@ -1289,6 +1672,7 @@ async def generate_shot_hybrid(
             shot.negative_prompt,
             video_provider,
             budget_mode,
+            profile.video_resolution,
         )
         metadata["video_generation_mode"] = "text_guided_fallback"
         metadata["video_provider_used"] = provider_used
