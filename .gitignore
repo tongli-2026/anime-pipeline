@@ -16,6 +16,11 @@ output/
 *.mp3
 *.wav
 
+# Sample artifacts
+backend/sample-shot-*.json
+backend/sample-result-*.json
+backend/sample-clips.txt
+
 # IDE
 .vscode/settings.json
 .idea/

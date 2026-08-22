@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/tongli-2026/anime-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/tongli-2026/anime-pipeline/actions/workflows/ci.yml)
 
-A cost-aware, human-in-the-loop AI agent system that transforms a manual anime generation workflow into an automated, controllable, and scalable pipeline.
+A cost-aware, human-in-the-loop anime generation pipeline that turns a story prompt into planned scenes, merged shot units, visuals, TTS, and a composed video. The system is designed to be resumable, budget-aware, and easy to steer with quality and provider controls.
 
 ## Architecture Overview
 
@@ -67,8 +67,11 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env        # add ANTHROPIC_API_KEY
-python -m anime_pipeline.main
+python -m anime_pipeline.main --auto --quality-preset standard
 ```
+
+Note: `OPENAI_API_KEY` (if set) is used by the pipeline for OpenAI Text-to-Speech and also for OpenAI image generation when the `openai` provider is selected.
+`--quality-preset` accepts `draft`, `standard`, or `high`, and `--budget-mode` accepts `budget`, `balanced`, or `quality`.
 
 ## Development Checks
 
@@ -88,5 +91,5 @@ Resume from a saved pipeline state:
 python -m anime_pipeline.main --state-file output/state_<run_id>.json --auto
 ```
 
-Video generation defaults to Seedance 1.5 Pro at 720p with native audio disabled.
-Use `--video-provider kling` or `--video-provider runway` to override it.
+Video generation defaults to Seedance on the video path, with native audio disabled.
+Use `--video-provider kling` or `--video-provider runway` to override it, and `--quality-preset` to trade speed for fidelity.
