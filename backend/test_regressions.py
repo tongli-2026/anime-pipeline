@@ -2113,8 +2113,8 @@ def test_shot_cli_example_is_hybrid_ready() -> None:
     assert shot.characters
     assert shot.characters[0].character_name == "Hana"
     assert shot.characters[0].prompt_base is not None
-    assert shot.characters[0].reference_image is None
-    assert shot.characters[0].reference_pack.primary_image is None
+    assert shot.characters[0].reference_image is not None
+    assert shot.characters[0].reference_pack.primary_image is not None
 
 
 def test_shot_cli_loads_json_file(tmp_path: Path) -> None:
@@ -2371,8 +2371,8 @@ def test_sequence_merges_adjacent_short_video_shots() -> None:
     assert len(units) == 1
     assert units[0].shot.duration_seconds == 4.0
     assert units[0].source_shot_ids == ["short-1", "short-2"]
-    assert "Beat 1 (0.0-2.0s" in (units[0].shot.generation_prompt or "")
-    assert "Beat 2 (2.0-4.0s" in (units[0].shot.generation_prompt or "")
+    assert "Time timeline:" in (units[0].shot.generation_prompt or "")
+    assert "2.0-4.0s (close_up, push_in)" in (units[0].shot.generation_prompt or "")
     assert units[0].shot.keyframes.ending_frame_prompt == "Hana facing the rooftop door"
 
 
