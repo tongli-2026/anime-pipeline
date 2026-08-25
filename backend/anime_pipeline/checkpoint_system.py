@@ -1,4 +1,4 @@
-# ==============================================================
+# ===================================================================================
 # Human-in-the-Loop Checkpoint System
 #
 # Purpose:
@@ -24,7 +24,7 @@
 #   - Designed for testability: provide `MockResolver` implementations in tests.
 #   - Timeouts and auto-approve policies are intentionally conservative to
 #     avoid blocking long-running CI or unattended runs.
-# ==============================================================
+# ===================================================================================
 
 from __future__ import annotations
 
@@ -244,11 +244,6 @@ class CLIResolver(CheckpointResolver):
         else:
             action = "continue"
         return BudgetWarningResolution(action=action)
-
-
-# --------------------------------------------------------------
-# Auto resolver — for optional checkpoints with timeout
-# --------------------------------------------------------------
 
 # --------------------------------------------------------------
 # Auto resolver — for optional checkpoints with timeout

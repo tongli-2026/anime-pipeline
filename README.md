@@ -70,7 +70,11 @@ cp .env.example .env        # add ANTHROPIC_API_KEY
 python -m anime_pipeline.main --auto --quality-preset standard
 ```
 
-Note: `OPENAI_API_KEY` (if set) is used by the pipeline for OpenAI Text-to-Speech and also for OpenAI image generation when the `openai` provider is selected.
+You can also point the CLI at a custom env file by setting
+`ANIME_PIPELINE_ENV_FILE=/path/to/your/.env` before running it. When unset,
+the pipeline falls back to the usual project `.env` locations.
+
+Note: `OPENAI_API_KEY` (if set) is used by the pipeline for OpenAI Text-to-Speech, OpenAI image generation when the `openai` provider is selected, and GPT-based structured stages such as scene breakdown, shot planning, prompt building, and TTS script formatting.
 `--quality-preset` accepts `draft`, `standard`, or `high`, and `--budget-mode` accepts `budget`, `balanced`, or `quality`.
 
 ## Development Checks

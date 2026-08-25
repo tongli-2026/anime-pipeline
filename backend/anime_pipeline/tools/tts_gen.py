@@ -1,4 +1,4 @@
-# ==============================================================
+# =================================================================================
 # Tool: TTS Audio Generation
 #
 # High-level: generate per-line spoken audio for character dialogues and
@@ -29,7 +29,7 @@
 #   - Network calls use `httpx`; some provider calls run in a thread pool.
 #   - The returned audio files are intended to be aligned into the timeline
 #     by the composition stage (`ffmpeg_compose`), which uses per-line offsets.
-# ==============================================================
+# =================================================================================
 
 from __future__ import annotations
 

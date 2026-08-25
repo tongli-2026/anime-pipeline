@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # ==============================================================
 # Prompt Builders — assemble prompts for LLM-driven stages
 #
@@ -17,6 +15,8 @@ from __future__ import annotations
 #    can be modeled and validated by downstream normalizers.
 #  - Keep batch/size tuning constants close to the top of the module.
 # ==============================================================
+from __future__ import annotations
+
 import json
 from typing import Any
 

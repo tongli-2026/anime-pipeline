@@ -2192,6 +2192,15 @@ def test_pipeline_estimate_includes_hybrid_keyframes_and_clips() -> None:
     assert cost.image_generations == 44
 
 
+def test_pipeline_estimate_respects_budget_mode_for_provider_selection() -> None:
+    balanced = estimate_pipeline_cost(12, 3, 2, 200, "standard", "balanced")
+    budget = estimate_pipeline_cost(12, 3, 2, 200, "standard", "budget")
+
+    assert budget.image_cost_usd < balanced.image_cost_usd
+    assert budget.tts_cost_usd < balanced.tts_cost_usd
+    assert budget.total_cost_usd < balanced.total_cost_usd
+
+
 @pytest.mark.asyncio
 async def test_structured_agent_routes_to_openai() -> None:
     captured: dict[str, object] = {}
@@ -2216,7 +2225,7 @@ async def test_structured_agent_routes_to_openai() -> None:
     agent = AgentDefinition(
         name="structured-test",
         role="test",
-        model="haiku",
+        model="gpt",
         system_prompt="Return JSON.",
     )
 
@@ -2256,7 +2265,7 @@ async def test_structured_agent_falls_back_to_claude_haiku() -> None:
     agent = AgentDefinition(
         name="fallback-test",
         role="test",
-        model="haiku",
+        model="gpt",
         system_prompt="Return JSON.",
     )
 

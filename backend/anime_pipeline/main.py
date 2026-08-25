@@ -20,7 +20,7 @@
 #     --quality-preset standard
 #
 #   .venv/bin/anime-pipeline \
-#     --input-file input/story_request.cinematic-action.json
+#     --input-file input/story_request.cinematic-action
 # 
 #   Resume from a saved state:
 #     .venv/bin/anime-pipeline --state-file output/state_<run_id>.json --auto
@@ -127,9 +127,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="anime-pipeline",
         description=(
-            "Run the anime generation pipeline from a reusable JSON input file. "
-            "Use --quality-preset draft, standard, or high to control image, "
-            "video, and final encoding quality consistently."
+            "Run or resume the anime generation pipeline from a reusable JSON input "
+            "file or saved pipeline state. Use --auto for non-interactive runs and "
+            "--quality-preset draft, standard, or high to control image, video, and "
+            "final encoding quality consistently."
         ),
     )
     parser.add_argument(

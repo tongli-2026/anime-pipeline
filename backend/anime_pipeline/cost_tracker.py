@@ -103,21 +103,21 @@ def calc_llm_cost(
     output_tokens: int,
     model: Literal[
         "sonnet",
-        "haiku",
         "claude_sonnet",
         "claude_haiku",
+        "gpt",
         "gpt_5_4_mini",
     ] = "sonnet",
 ) -> CostRecord:
     if model in ("sonnet", "claude_sonnet"):
         input_rate = PRICING["llm"]["claude_sonnet_input"]
         output_rate = PRICING["llm"]["claude_sonnet_output"]
-    elif model in ("haiku", "claude_haiku"):
-        input_rate = PRICING["llm"]["claude_haiku_input"]
-        output_rate = PRICING["llm"]["claude_haiku_output"]
-    else:
+    elif model in ("gpt", "gpt_5_4_mini"):
         input_rate = PRICING["llm"]["gpt_5_4_mini_input"]
         output_rate = PRICING["llm"]["gpt_5_4_mini_output"]
+    else:
+        input_rate = PRICING["llm"]["claude_haiku_input"]
+        output_rate = PRICING["llm"]["claude_haiku_output"]
 
     llm_cost = (input_tokens / 1_000_000) * input_rate + (output_tokens / 1_000_000) * output_rate
 
@@ -269,10 +269,21 @@ def estimate_pipeline_cost(
     primary_character_count: int,
     avg_dialogue_chars_per_scene: int,
     quality_preset: Literal["draft", "standard", "high"] = "standard",
+    budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
 ) -> CostRecord:
+    # Image planning includes:
+    # - character candidates generated during proposal
+    # - locked primary-character starter reference packs
+    # - still scene images
+    # - hybrid shot opening/ending keyframes
     candidates_per_char = 4
+    reference_pack_images_per_char = 3
+    shots_per_scene = 2
+    keyframes_per_hybrid_shot = 2
     image_quality: Literal["standard", "hd"] = "hd" if quality_preset == "high" else "standard"
-    image_provider: Literal["fal", "openai"] = "fal" if quality_preset == "draft" else "openai"
+    image_provider: Literal["fal", "openai"] = (
+        "fal" if quality_preset == "draft" or budget_mode == "budget" else "openai"
+    )
     video_provider: BillableVideoProvider = "seedance"
     if quality_preset == "draft":
         video_resolution: Literal["480p", "720p", "1080p"] = "480p"
@@ -295,27 +306,27 @@ def estimate_pipeline_cost(
     llm_cost = add_costs(creative_llm_cost, structured_llm_cost)
 
     # Character candidate images
-    char_image_cost = calc_image_cost(
+    character_candidate_image_cost = calc_image_cost(
         primary_character_count * candidates_per_char,
         image_quality,
         image_provider,
     )
 
     # Minimum starter pack: three-quarter portrait, full body, expression sheet.
-    reference_pack_cost = calc_image_cost(
-        primary_character_count * 3,
+    reference_pack_image_cost = calc_image_cost(
+        primary_character_count * reference_pack_images_per_char,
         image_quality,
         "openai",
     )
 
-    # Shot-level generation estimate: two shots per scene and two hybrid shots
-    # per key scene. Each hybrid consumes two GPT keyframes plus one video clip.
-    estimated_shot_count = scene_count * 2
+    # Shot-level generation estimate: two shots per scene, with key scenes
+    # expanded into up to two hybrid shots each.
+    estimated_shot_count = scene_count * shots_per_scene
     hybrid_shot_count = min(estimated_shot_count, key_scene_count * 2)
     still_shot_count = estimated_shot_count - hybrid_shot_count
     scene_image_cost = calc_image_cost(still_shot_count, image_quality, image_provider)
-    keyframe_cost = calc_image_cost(
-        hybrid_shot_count * 2,
+    keyframe_image_cost = calc_image_cost(
+        hybrid_shot_count * keyframes_per_hybrid_shot,
         image_quality,
         "openai",
     )
@@ -330,16 +341,18 @@ def estimate_pipeline_cost(
     # TTS
     tts_cost = calc_tts_cost(
         scene_count * avg_dialogue_chars_per_scene,
+        provider="auto",
+        budget_mode=budget_mode,
         quality=image_quality,
     )
 
     total = zero_cost()
     for part in [
         llm_cost,
-        char_image_cost,
-        reference_pack_cost,
+        character_candidate_image_cost,
+        reference_pack_image_cost,
         scene_image_cost,
-        keyframe_cost,
+        keyframe_image_cost,
         video_cost,
         tts_cost,
     ]:

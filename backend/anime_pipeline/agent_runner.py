@@ -1,4 +1,4 @@
-# ==============================================================
+# ===============================================================================
 # Agent Runner — reliable single-call LLM wrapper
 #
 # Responsibilities:
@@ -11,14 +11,14 @@
 #
 # Routing rules:
 #   - Creative/long-form `sonnet` calls go to Anthropic by default.
-#   - Structured `haiku` calls prefer OpenAI's structured JSON API when
+#   - Structured `gpt` calls prefer OpenAI's structured JSON API when
 #     an OpenAI key is available; otherwise fall back to Claude/Anthropic.
 #
 # Notes:
 #   - This module deliberately exposes a small `LLMRouter` container so
 #     tests can inject mock clients. See `create_llm_router()` for the
 #     production client wiring.
-# ==============================================================
+# ===============================================================================
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ T = TypeVar("T")
 
 ANTHROPIC_MODEL_MAP: dict[AgentModel, str] = {
     "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+    "gpt": "claude-haiku-4-5-20251001",
 }
 OPENAI_STRUCTURED_MODEL = "gpt-5.4-mini"
 
@@ -149,7 +149,7 @@ async def _call_routed(
     if not isinstance(client, LLMRouter):
         return await _call_anthropic(agent, user_prompt, client)
 
-    if agent.model == "haiku" and client.openai_client is not None:
+    if agent.model == "gpt" and client.openai_client is not None:
         try:
             return await _call_openai_structured(agent, user_prompt, client.openai_client)
         except Exception as exc:

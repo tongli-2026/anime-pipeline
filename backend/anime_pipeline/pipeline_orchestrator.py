@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -702,10 +703,11 @@ async def run_pipeline(
         # Derive a lightweight heuristic from `user_input` to produce a
         # more accurate pre-generation estimate instead of hard-coded numbers.
         target_secs = getattr(user_input, "target_duration_seconds", None) or 180
-        # Estimate scenes by dividing target duration into ~15s scenes
-        scene_count = max(1, int(target_secs / 15))
-        # Key scenes are roughly one per 4 scenes, clamped to [1, 3]
-        key_scene_count = min(3, max(1, scene_count // 4))
+        # Estimate scenes by dividing target duration into ~10s scenes.
+        # Use ceiling to avoid undercounting shorter stories.
+        scene_count = max(1, math.ceil(target_secs / 10))
+        # Key scenes are roughly half of the total scene count, with at least 1.
+        key_scene_count = max(1, math.ceil(scene_count / 2))
         primary_character_count = len(user_input.primary_characters or []) or 1
         story_outline_chars = len(user_input.story_outline or "")
         avg_dialogue_chars_per_scene = (
@@ -718,6 +720,7 @@ async def run_pipeline(
             primary_character_count,
             avg_dialogue_chars_per_scene,
             options.quality_preset,
+            options.budget_mode,
         )
         console.print("\n[bold]📊 Cost Estimate (before generation):[/bold]")
         console.print(format_cost_summary(estimate))

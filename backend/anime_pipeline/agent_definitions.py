@@ -4,7 +4,7 @@
 # Static, declarative configurations for single LLM calls used by the
 # pipeline orchestrator. An `AgentDefinition` describes: the logical
 # role (what the LLM is responsible for), which model tier to use
-# (creative `sonnet` vs structured `haiku`), the system prompt, and
+# (creative `sonnet` vs structured `gpt`), the system prompt, and
 # size/behavioral overrides. These definitions are NOT autonomous
 # agents — they are invoked synchronously by the orchestrator
 # (single-director pattern) and produce deterministic JSON/text outputs
@@ -13,7 +13,7 @@
 # Model tiers (high level):
 #   - `sonnet`: creative, long-form generation (character proposals,
 #       story writing). Higher token budgets and more open-ended output.
-#   - `haiku`: structured extraction and templating (scene breakdown,
+#   - `gpt`: structured extraction and templating (scene breakdown,
 #       shot planning, prompt building, TTS script). Constrained JSON
 #       outputs, lower cost, and deterministic formatting.
 #
@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-AgentModel = Literal["sonnet", "haiku"]
+AgentModel = Literal["sonnet", "gpt"]
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ class AgentDefinition:
     Attributes:
         name:          Unique identifier used in logs and AGENT_REGISTRY lookups.
         role:          One-line description of the configuration's responsibility.
-        model:         "sonnet" for creative tasks, "haiku" for structured tasks.
+        model:         "sonnet" for creative tasks, "gpt" for structured tasks.
         system_prompt: The system message sent to the LLM, defining output format
                        and constraints.
         readonly:      True means this configuration only reads data and does not
@@ -173,13 +173,13 @@ Do NOT include markdown code fences (```). Do NOT include any text before or aft
 # ==============================================================
 # 3. Scene Breakdown Agent
 # Goal: parse Story → Scene JSON with character slots
-# Model: haiku (structured extraction, cheap)
+# Model: gpt (structured extraction, cheap)
 # ==============================================================
 
 SCENE_BREAKDOWN_AGENT = AgentDefinition(
     name="scene-breakdown",
     role="Convert story outline to structured scene JSON with character assignments and narrative priority",
-    model="haiku",
+    model="gpt",
     readonly=False,
     max_tokens=16384,  # scene JSON can be large (8 scenes × ~600 tokens each)
     system_prompt="""You are a production coordinator for anime.
@@ -247,13 +247,13 @@ Rules:
 # ==============================================================
 # 4. Shot Planning Agent
 # Goal: expand scenes into shot-level production plan
-# Model: haiku
+# Model: gpt
 # ==============================================================
 
 SHOT_PLANNING_AGENT = AgentDefinition(
     name="shot-planning",
     role="Expand scenes into shot-by-shot production plan with keyframes and audio intent",
-    model="haiku",
+    model="gpt",
     readonly=False,
     max_tokens=16384,
     system_prompt="""You are a storyboard and shot-planning specialist for anime production.
@@ -319,13 +319,13 @@ Output format: JSON array of shot objects. Output ONLY the array.""",
 # ==============================================================
 # 5. Secondary Character Agent
 # Goal: auto-generate background/supporting characters per scene
-# Model: haiku (lightweight, many calls)
+# Model: gpt (lightweight, many calls)
 # ==============================================================
 
 SECONDARY_CHARACTER_AGENT = AgentDefinition(
     name="secondary-character",
     role="Auto-generate secondary characters for scenes that need them",
-    model="haiku",
+    model="gpt",
     readonly=False,
     system_prompt="""You are a supporting cast designer for anime.
 
@@ -351,13 +351,13 @@ Output format: JSON array of SecondaryCharacter objects, grouped by scene.""",
 # ==============================================================
 # 6. Scene Prompt Builder Agent
 # Goal: build final image/video generation prompts per shot
-# Model: haiku (templating, cheap)
+# Model: gpt (templating, cheap)
 # ==============================================================
 
 SCENE_PROMPT_BUILDER_AGENT = AgentDefinition(
     name="scene-prompt-builder",
     role="Compose final generation prompts for each shot combining characters, setting and keyframes",
-    model="haiku",
+    model="gpt",
     max_tokens=8192,  # 8 scenes × ~400 tokens each = ~3200, leave headroom
     readonly=False,
     system_prompt="""You are a prompt engineer for anime image and video generation.
@@ -397,13 +397,13 @@ Output format: JSON array of { shot_id, scene_id, prompt, negative_prompt, type 
 # ==============================================================
 # 7. TTS Script Agent
 # Goal: format dialogue lines into TTS-ready script
-# Model: haiku
+# Model: gpt
 # ==============================================================
 
 TTS_SCRIPT_AGENT = AgentDefinition(
     name="tts-script",
     role="Format dialogue and inner monologue into TTS-ready script with emotion hints",
-    model="haiku",
+    model="gpt",
     max_tokens=8192,  # TTS script for 8 scenes with SSML can be ~3000 tokens
     readonly=False,
     system_prompt="""You are a voice direction specialist for anime dubbing.

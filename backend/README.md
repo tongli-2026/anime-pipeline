@@ -35,6 +35,9 @@ pip install -e ".[dev]"
 cp .env.example .env   # add your ANTHROPIC_API_KEY
 ```
 
+If you want to load a custom env file instead of the default `.env` locations,
+set `ANIME_PIPELINE_ENV_FILE=/path/to/your/.env` before running the CLI or tests.
+
 ## Run
 
 ```bash
@@ -156,10 +159,10 @@ Agent                    Model     Role                              R/W
 ────────────────────────────────────────────────────────────────────────
 character-proposal       sonnet    Generate character candidates      W (images)
 story-generation         sonnet    Write full story + scene list      R
-scene-breakdown          haiku     Parse story → scene JSON           R
-secondary-character      haiku     Generate supporting cast           W (images)
-scene-prompt-builder     haiku     Compose generation prompts         R
-tts-script               haiku     Format dialogue for TTS            R
+scene-breakdown          gpt       Parse story → scene JSON           R
+secondary-character      gpt       Generate supporting cast           W (images)
+scene-prompt-builder     gpt       Compose generation prompts         R
+tts-script               gpt       Format dialogue for TTS            R
 ```
 
 ## Human checkpoint map
@@ -208,11 +211,11 @@ run_pipeline()                          ← sole Director
     ├─ await run_agent(CHARACTER_PROPOSAL_AGENT, ...)   # sonnet — character design
     │     ↓ [user checkpoint — required, blocks here]
     ├─ await run_agent(STORY_GENERATION_AGENT, ...)     # sonnet — narrative writing
-    ├─ await run_agent(SCENE_BREAKDOWN_AGENT, ...)      # haiku  — JSON extraction
-    ├─ await run_agent(SECONDARY_CHARACTER_AGENT, ...)  # haiku  — supporting cast
-    ├─ await run_agent(SCENE_PROMPT_BUILDER_AGENT, ...) # haiku  — prompt assembly
+    ├─ await run_agent(SCENE_BREAKDOWN_AGENT, ...)      # gpt  — JSON extraction
+    ├─ await run_agent(SECONDARY_CHARACTER_AGENT, ...)  # gpt  — supporting cast
+    ├─ await run_agent(SCENE_PROMPT_BUILDER_AGENT, ...) # gpt  — prompt assembly
     │     ↓ [parallel image/video generation — asyncio.gather]
-    └─ await run_agent(TTS_SCRIPT_AGENT, ...)           # haiku  — SSML formatting
+    └─ await run_agent(TTS_SCRIPT_AGENT, ...)           # gpt  — SSML formatting
 ```
 
 ### Why sequential, not concurrent?
@@ -228,7 +231,7 @@ Introducing autonomous agents would add complexity with zero throughput benefit.
 The only parallel layer is **image/video generation** (`asyncio.gather` in
 `tools/image_gen.py`), which does not involve the LLM at all.
 
-### Model tiering: sonnet vs haiku
+### Model tiering: sonnet vs gpt
 
 | Model | Used for | Reason |
 |-------|----------|--------|
@@ -237,8 +240,9 @@ The only parallel layer is **image/video generation** (`asyncio.gather` in
 | **Claude Haiku 4.5** | structured fallback | Keeps the pipeline operational when OpenAI is unavailable |
 
 `LLMRouter` selects the provider by agent tier. It retains dependency injection for
-mock tests and falls back from OpenAI to Claude Haiku without changing orchestration
-code. Cost records use the model that actually completed each call.
+mock tests and falls back from OpenAI GPT structured calls to Claude Haiku without
+changing orchestration code. Cost records use the model that actually completed each
+call.
 
 ### Other key design decisions
 
@@ -265,5 +269,5 @@ code. Cost records use the model that actually completed each call.
 | Checkpoint / stop-hook system | `query.ts` stop hooks | `checkpoint_system.py` required/optional checkpoints |
 | Agent dependency injection | `QueryDeps` pattern | `run_agent(agent, prompt, client)` |
 | Coordinator prompt style | `coordinatorMode.ts` | `pipeline_orchestrator.py` orchestration logic |
-| Cheap model for structured tasks | haiku in explore agents | haiku for breakdown, prompt-build, tts-script |
+| Cheap model for structured tasks | gpt in structured agents | gpt for breakdown, prompt-build, tts-script |
 | Expensive model for creative tasks | sonnet in main loop | sonnet for character-proposal, story-generation |
