@@ -49,8 +49,8 @@ import httpx
 
 from ..cost_tracker import add_costs, calc_tts_cost, zero_cost
 from ..env import get_config
-from ..output_paths import get_run_output_root, set_run_output_root
 from ..models import CostRecord
+from ..output_paths import get_run_output_root, set_run_output_root
 
 logger = logging.getLogger(__name__)
 

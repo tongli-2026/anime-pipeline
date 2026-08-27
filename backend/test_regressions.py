@@ -88,6 +88,7 @@ from anime_pipeline.normalizers import (
     align_shot_durations_to_scene_targets,
 )
 from anime_pipeline.normalizers import normalize_scene as _normalize_scene
+from anime_pipeline.output_paths import get_run_output_root
 from anime_pipeline.pipeline_orchestrator import (
     PipelineOptions,
     _apply_cost_and_persist_state,
@@ -119,10 +120,10 @@ from anime_pipeline.pipeline_state import (
 from anime_pipeline.quality import get_quality_profile
 from anime_pipeline.shot_cli import build_example_shot, build_parser, load_shot_from_file
 from anime_pipeline.tools.image_gen import (
+    _log_provider_prompt_debug,
     _reference_pack_specs,
     _select_reference_image_for_shot,
     _starter_reference_pack_specs,
-    _log_provider_prompt_debug,
     set_debug_prompts,
 )
 from anime_pipeline.tools.tts_gen import (
@@ -136,7 +137,6 @@ from anime_pipeline.tools.tts_gen import (
     _speed_from_hint,
 )
 from anime_pipeline.voice_profiles import infer_voice_profile
-from anime_pipeline.output_paths import get_run_output_root
 
 
 def _make_state() -> PipelineState:

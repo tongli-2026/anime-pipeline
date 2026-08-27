@@ -51,7 +51,6 @@ import jwt
 
 from ..cost_tracker import add_costs, calc_image_cost, calc_video_cost, zero_cost
 from ..env import get_config
-from ..output_paths import get_run_output_root, set_run_output_root
 from ..models import (
     BillableVideoProvider,
     CharacterCandidate,
@@ -66,6 +65,7 @@ from ..models import (
     Shot,
     VideoProvider,
 )
+from ..output_paths import get_run_output_root, set_run_output_root
 from ..quality import VideoResolution, get_quality_profile
 
 logger = logging.getLogger(__name__)

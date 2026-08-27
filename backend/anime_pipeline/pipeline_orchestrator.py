@@ -95,6 +95,7 @@ from .normalizers import (
 from .normalizers import (
     normalize_shot as _normalize_shot,
 )
+from .output_paths import get_run_output_root
 from .pipeline_state import (
     BudgetExceededError,
     add_secondary_characters,
@@ -123,16 +124,19 @@ from .prompt_builders import (
     _run_scene_prompt_builder,
     _serialize_scene_prompt_builder_shot,  # noqa: F401
 )
-from .output_paths import get_run_output_root
-from .tools.ffmpeg_compose import compose_video, set_output_root as set_ffmpeg_output_root
+from .tools.ffmpeg_compose import compose_video
+from .tools.ffmpeg_compose import set_output_root as set_ffmpeg_output_root
 from .tools.image_gen import (
     generate_character_images,
     generate_character_reference_pack,
     generate_scene_image,
     generate_shot_hybrid,
+)
+from .tools.image_gen import (
     set_output_root as set_image_output_root,
 )
-from .tools.tts_gen import TTSLine, generate_tts, set_output_root as set_tts_output_root
+from .tools.tts_gen import TTSLine, generate_tts
+from .tools.tts_gen import set_output_root as set_tts_output_root
 from .voice_profiles import ensure_character_voice_profiles, resolve_voice_profile_for_line
 
 console = Console()
