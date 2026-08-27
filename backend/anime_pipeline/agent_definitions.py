@@ -112,30 +112,31 @@ Your task is to write a complete story outline including:
 - Genre tags (1–3 genres, as a list of strings)
 - Three-act structure with clear arc
 - Estimated total duration in seconds that matches the requested target duration
-- A list of narrative scenes sized for editorial pacing, not fixed-length chunks
+- A list of coarse narrative scenes that describe the story at a beat level
 
 For each scene, output:
 - title: short scene name
-- description: what happens (2–4 sentences)
+- description: what happens (2–4 sentences, focused on story intent rather than shot direction)
 - location: where it takes place
 - time_of_day: "morning" | "afternoon" | "evening" | "night"
 - mood: emotional tone (e.g., "tense", "melancholy", "triumphant")
-- type: "key" (important narrative moment → video) | "normal" (transition/buildup → image)
-  - Rule: ~20% of scenes should be "key" scenes
-- duration_seconds: estimated screen time (key: 10–30s, normal: 5–15s)
+- duration_seconds: estimated screen time for the beat
 - characters: list of character names who appear in this scene
 - dialogue: optional 0–6 spoken lines when dialogue is needed
 - inner_monologue: optional 0–4 lines when emotional subtext matters
 - audio_cues: optional spoken narration/ambient thought fragments not owned by a
-  named character, e.g. crowd thought-ribbon whispers with mixed male/female voices
+  named character, if they help tell the story
 
 Balance:
 - Vary mood across scenes (no 5 consecutive "tense" scenes)
 - Ensure all primary characters have meaningful screen time
 - End with an emotionally satisfying conclusion
 - Match the user's requested target duration closely; do not default to 300 seconds
-- Prefer scenes that can later be decomposed into multiple shots; do not make every scene equally long
+- Prefer scenes that are easy to later decompose into shots, but do not add shot-level production details
 - Use silence or visual acting when appropriate; not every scene needs spoken dialogue
+- In key turning-point scenes, include at least 1-3 dialogue or inner_monologue lines when they help make the emotional beat legible
+- Use 0 lines only when silence itself is the intended dramatic choice
+- When a scene contains a reveal, confrontation, confession, or emotional reversal, favor concrete spoken lines or inner thought over vague summary prose
 
 CRITICAL: Output ONLY a single JSON object with this structure (no preamble, no markdown):
 {
@@ -150,7 +151,6 @@ CRITICAL: Output ONLY a single JSON object with this structure (no preamble, no 
       "location": "Location",
       "time_of_day": "morning|afternoon|evening|night",
       "mood": "Mood",
-      "type": "key|normal",
       "duration_seconds": 10.5,
       "characters": ["Character 1", "Character 2"],
       "dialogue": ["Line 1", "Line 2"],
@@ -158,7 +158,7 @@ CRITICAL: Output ONLY a single JSON object with this structure (no preamble, no 
       "audio_cues": [
         {
           "type": "ambient",
-          "text": "A visible thought-ribbon fragment if it should be heard aloud",
+          "text": "A visible thought fragment if it should be heard aloud",
           "emotion": "female_young; anxious whisper"
         }
       ]
@@ -187,7 +187,7 @@ SCENE_BREAKDOWN_AGENT = AgentDefinition(
 You will receive a story outline and the list of locked characters.
 
 Your task:
-1. Break the story into individual scenes
+1. Turn the coarse story scenes into production-ready scenes
 2. For each scene, assign character IDs and set CharacterState:
    - expression: what their face shows
    - action: what they are physically doing
@@ -231,16 +231,19 @@ Each scene object must have these fields:
 
 Rules:
 - Do NOT invent new primary characters — only assign from the locked list
+- Convert story-level beats into production scenes; this is the stage that adds
+  scene-level structure for downstream shot planning
 - Every dialogue item must be {"character_id": "<locked character id>", "text": "...", "emotion": "..."}.
   Never use speaker/line or speaker_id/line aliases.
 - Every inner_monologue item must identify its speaking character with character_id.
   Use an audio cue of type narration when no character owns the voice.
+- Preserve and, when useful, slightly expand the story's dialogue and inner_monologue so emotional turns stay understandable in the scene-level plan.
 - If a scene needs a "crowd", "guard", "bystander", etc., mark it with:
   secondary_characters_needed: ["description1", "description2"]
 - Keep CharacterState consistent with the scene's mood and narrative moment
-- is_action_heavy and priority_score drive budget optimization: high-priority
-  scenes with action are more likely to get video generation if budget allows
-- Initially set needs_video = is_action_heavy (the orchestrator will refine this based on budget)""",
+- is_action_heavy and priority_score are soft hints only; the orchestrator will
+  later decide shot-level video allocation from utility and budget
+- Set needs_video as a rough narrative hint, not a final production decision""",
 )
 
 
@@ -287,8 +290,9 @@ Your task:
    - keyframes:
        opening_frame_prompt
        ending_frame_prompt
-       optional middle_frame_prompt
-   - estimated_generation_mode: image | video | hybrid
+   - estimated_generation_mode:
+     • image = generate this shot as a pure still image
+     • hybrid = generate opening/ending keyframes first, then generate the shot as a clip
 
 Rules:
 - Total shot durations within a scene should approximately match the scene duration
@@ -296,15 +300,12 @@ Rules:
 - Use inner_monologue when emotional subtext matters even if dialogue is sparse
 - Every dialogue item must use character_id, text, and emotion; never speaker/line aliases
 - Every inner_monologue item must include the character_id of the character whose voice is heard
-- Use audio_cues with type "ambient" for audible crowd thought-ribbon fragments.
-  For anonymous thought voices, leave character_id empty and put a stable voice hint
-  in emotion, such as "male_young; hurried whisper" or "female_young; anxious whisper".
-  Ambient TTS cue text must be the exact words to speak, not sound-design
-  description. Keep each ambient thought cue under 8 words, e.g. "test tomorrow"
-  or "don't look at me". Put non-spoken wind, silence, density, or texture notes
-  in audio_cues only when they should not be read by TTS.
 - Spoken dialogue is optional; some shots should rely on silence, reaction, or inner monologue instead
-- Prefer hybrid or video only for motion-critical shots
+- Preserve story and scene-level dialogue/inner_monologue intent; do not flatten emotional beats into purely visual description when speech would clarify the moment
+- Prefer hybrid for motion-critical shots
+- The orchestrator will later re-rank shots by utility/cost and may override
+  `estimated_generation_mode`, so make the best local editorial choice rather than
+  trying to solve the final budget allocation here
 - Output concise but production-usable keyframe prompts
 - purpose must be exactly one of: establishing, dialogue, reaction, action, transition, insert, climax
 - shot_scale must be exactly one of: extreme_wide, wide, medium, close_up, extreme_close_up
@@ -350,7 +351,7 @@ Output format: JSON array of SecondaryCharacter objects, grouped by scene.""",
 
 # ==============================================================
 # 6. Scene Prompt Builder Agent
-# Goal: build final image/video generation prompts per shot
+# Goal: build final image/hybrid generation prompts per shot
 # Model: gpt (templating, cheap)
 # ==============================================================
 
@@ -360,12 +361,12 @@ SCENE_PROMPT_BUILDER_AGENT = AgentDefinition(
     model="gpt",
     max_tokens=8192,  # 8 scenes × ~400 tokens each = ~3200, leave headroom
     readonly=False,
-    system_prompt="""You are a prompt engineer for anime image and video generation.
+    system_prompt="""You are a prompt engineer for anime image and hybrid generation.
 
 You will receive for each shot:
 - Parent scene context
 - Shot purpose, duration, framing, camera angle, camera motion
-- Keyframe prompts for opening/middle/ending frames
+- Keyframe prompts for opening/ending frames
 - List of characters with their CharacterState (expression, action, outfit, emotion, position)
 - Primary characters' locked prompt_base strings
 - Secondary characters' prompt_base strings
@@ -385,7 +386,7 @@ Rules:
 - Preserve the locked prompt_base of primary characters verbatim
 - Add CharacterState details AFTER the prompt_base, do not modify it
 - Include keyframe guidance explicitly when provided
-- For video or hybrid shots: add "smooth motion, fluid animation, [camera movement hint]"
+- For hybrid shots: add "smooth motion, fluid animation, [camera movement hint]"
 - For image shots: add "detailed still frame, sharp focus"
 - Keep total prompt under 400 tokens
 - Negative prompt: "lowres, bad anatomy, bad hands, text, watermark, deformed"

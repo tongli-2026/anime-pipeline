@@ -2,8 +2,8 @@
 # Generation Planning — assemble provider-friendly generation units
 #
 # This module converts an editorial shot-level plan into a list of
-# `GenerationUnit` objects that are suitable to send to image/video
-# providers. The main goal is to merge adjacent short video/hybrid shots
+# `GenerationUnit` objects that are suitable to send to image/hybrid
+# providers. The main goal is to merge adjacent short hybrid shots
 # into provider-supported duration windows while preserving continuity
 # and production intent.
 #
@@ -23,7 +23,7 @@
 #
 # Notes for maintainers:
 #   - Tweak `_can_merge_shots()` to change the safety heuristics for merging.
-#   - Keep `VIDEO_GENERATION_MODES` in sync with the rest of the pipeline.
+#   - Keep `HYBRID_GENERATION_MODES` in sync with the rest of the pipeline.
 #   - The composition and provider code expects merged shots to be full-frame
 #     cinematic prompts (16:9) and to avoid storyboard/panel outputs.
 # ==============================================================
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from .models import GenerationUnit, Shot
 
-VIDEO_GENERATION_MODES = {"video", "hybrid"}
+HYBRID_GENERATION_MODES = {"hybrid"}
 
 
 def _can_merge_shots(left: Shot, right: Shot, combined_duration: float) -> bool:
@@ -40,8 +40,8 @@ def _can_merge_shots(left: Shot, right: Shot, combined_duration: float) -> bool:
     return (
         left.output is None
         and right.output is None
-        and left.estimated_generation_mode in VIDEO_GENERATION_MODES
-        and right.estimated_generation_mode in VIDEO_GENERATION_MODES
+        and left.estimated_generation_mode in HYBRID_GENERATION_MODES
+        and right.estimated_generation_mode in HYBRID_GENERATION_MODES
         and left.scene_id == right.scene_id
         and left.location.strip().casefold() == right.location.strip().casefold()
         and left.time_of_day.strip().casefold() == right.time_of_day.strip().casefold()
@@ -52,7 +52,8 @@ def _can_merge_shots(left: Shot, right: Shot, combined_duration: float) -> bool:
 
 def _merge_shot_group(shots: list[Shot]) -> Shot:
     if len(shots) == 1:
-        return shots[0]
+        shot = shots[0]
+        return shot
 
     first = shots[0]
     last = shots[-1]
@@ -118,11 +119,7 @@ def _merge_shot_group(shots: list[Shot]) -> Shot:
             "ending_frame_path": last.ending_frame_path,
             "generation_prompt": prompt,
             "negative_prompt": ", ".join(negative_prompts) or None,
-            "estimated_generation_mode": (
-                "hybrid"
-                if any(shot.estimated_generation_mode == "hybrid" for shot in shots)
-                else "video"
-            ),
+            "estimated_generation_mode": "hybrid",
             "output": None,
         }
     )
@@ -134,7 +131,7 @@ def build_generation_units(
     min_duration_seconds: float = 4.0,
     max_duration_seconds: float = 12.0,
 ) -> list[GenerationUnit]:
-    """Merge compatible short video shots into provider-supported duration windows."""
+    """Merge compatible short hybrid shots into provider-supported duration windows."""
     if min_duration_seconds <= 0:
         raise ValueError("Minimum generation duration must be greater than zero")
     if max_duration_seconds < min_duration_seconds:
@@ -147,7 +144,7 @@ def build_generation_units(
         duration = shots[index].duration_seconds
         index += 1
 
-        if shots[index - 1].estimated_generation_mode in VIDEO_GENERATION_MODES:
+        if shots[index - 1].estimated_generation_mode in HYBRID_GENERATION_MODES:
             while duration < min_duration_seconds and index < len(shots):
                 candidate = shots[index]
                 combined_duration = duration + candidate.duration_seconds

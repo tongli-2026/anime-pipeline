@@ -55,7 +55,7 @@ _MALE_TERMS = {
     "him",
 }
 _YOUNG_TERMS = {"young", "teen", "teenage", "student", "school", "youth", "child", "kid"}
-_OLDER_TERMS = {"old", "older", "elder", "elderly", "aged", "veteran", "ancient", "mature"}
+_OLDER_TERMS = {"old", "older", "elder", "elderly", "veteran", "ancient", "mature"}
 
 
 def _words(text: str) -> set[str]:
@@ -77,10 +77,13 @@ def infer_voice_profile(description_parts: Iterable[str]) -> str:
             gender = "female" if has_female else "male"
             break
 
-    age_match = re.search(r"\b(\d{1,3})\s*(?:-|\s)year(?:-|\s)old\b", text.lower())
+    lower = text.lower()
+    age_match = re.search(r"\b(\d{1,3})\s*(?:-|\s)year(?:-|\s)old\b", lower)
     if age_match:
         numeric_age = int(age_match.group(1))
         age = "young" if numeric_age < 35 else "old"
+    elif any(term in lower for term in ("high-school-aged", "school-aged", "teenaged")):
+        age = "young"
     else:
         age = "old" if words & _OLDER_TERMS else "young" if words & _YOUNG_TERMS else "adult"
 
@@ -92,7 +95,6 @@ def infer_voice_profile(description_parts: Iterable[str]) -> str:
         voice_key = "default"
 
     texture = "clear, expressive"
-    lower = text.lower()
     if any(term in lower for term in ("calm", "gentle", "soft", "warm", "kind")):
         texture = "warm, gentle"
     elif any(term in lower for term in ("tense", "guarded", "stoic", "serious", "cold")):

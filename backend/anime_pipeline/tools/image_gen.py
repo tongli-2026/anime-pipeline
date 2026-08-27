@@ -51,6 +51,7 @@ import jwt
 
 from ..cost_tracker import add_costs, calc_image_cost, calc_video_cost, zero_cost
 from ..env import get_config
+from ..output_paths import get_run_output_root, set_run_output_root
 from ..models import (
     BillableVideoProvider,
     CharacterCandidate,
@@ -68,9 +69,10 @@ from ..models import (
 from ..quality import VideoResolution, get_quality_profile
 
 logger = logging.getLogger(__name__)
+_DEBUG_PROMPTS = False
 
-OUTPUT_DIR = Path("./output/images")
-VIDEO_OUTPUT_DIR = Path("./output/videos")
+OUTPUT_DIR = get_run_output_root() / "images"
+VIDEO_OUTPUT_DIR = get_run_output_root() / "videos"
 
 SEEDANCE_TEXT_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"
 SEEDANCE_IMAGE_MODEL = "fal-ai/bytedance/seedance/v1.5/pro/image-to-video"
@@ -96,6 +98,21 @@ class PromptLintIssue:
     severity: Literal["warning", "high"]
     message: str
     excerpt: str
+
+
+def set_debug_prompts(enabled: bool) -> None:
+    """Enable or disable verbose prompt logging for provider debugging."""
+    global _DEBUG_PROMPTS
+    _DEBUG_PROMPTS = enabled
+
+
+def set_output_root(output_root: str | Path) -> Path:
+    """Point image/video generation outputs at a run-scoped directory."""
+    global OUTPUT_DIR, VIDEO_OUTPUT_DIR
+    root = set_run_output_root(output_root)
+    OUTPUT_DIR = root / "images"
+    VIDEO_OUTPUT_DIR = root / "videos"
+    return root
 
 
 def _artifact_id(value: str) -> str:
@@ -159,8 +176,6 @@ def _sanitize_visual_prompt(prompt: str) -> str:
         r"\berupt from her body\b": "flare around her",
         r"\berupting from her chest\b": "spiraling around her shoulders",
         r"\berupt from her chest\b": "spiral around her shoulders",
-        r"\bdeep red ribbons erupt from her chest and throat\b": "deep red ribbons swirl around her shoulders",
-        r"\bdeep red ribbons erupting from her chest and throat\b": "deep red ribbons swirling around her shoulders",
         r"\bviolent\b": "intense",
         r"\bviolently\b": "intensely",
         r"\bexposed\b": "revealed",
@@ -171,7 +186,7 @@ def _sanitize_visual_prompt(prompt: str) -> str:
     sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
     guardrail = (
         "Fully clothed, non-sexual character design, modest school uniform, "
-        "focus on facial emotion and supernatural ribbons."
+        "focus on facial emotion and supernatural thought fragments."
     )
     if "non-sexual character design" not in sanitized.lower():
         sanitized = f"{sanitized}\n\n{guardrail}"
@@ -322,6 +337,12 @@ def _log_provider_prompt_lint(provider_label: str, prompt: str) -> list[PromptLi
                 issue.excerpt,
             )
     return issues
+
+
+def _log_provider_prompt_debug(provider_label: str, prompt: str) -> None:
+    """Emit the exact prompt only when prompt debugging is enabled."""
+    if _DEBUG_PROMPTS:
+        logger.info("%s prompt:\n%s", provider_label, prompt)
 
 
 def _build_visual_character_anchor(shot_character: Any) -> str:
@@ -554,6 +575,7 @@ async def _call_fal_image(
 ) -> str:
     """Call fal.ai Flux for image generation using new SDK. Returns image URL."""
     cfg = get_config()
+    _log_provider_prompt_debug("fal image", prompt)
     _log_provider_prompt_lint("fal image", prompt)
 
     # Import fal_client SDK
@@ -600,6 +622,7 @@ async def _call_fal_image_to_image(
 ) -> str:
     """Call fal.ai FLUX image-to-image using a reference image."""
     cfg = get_config()
+    _log_provider_prompt_debug("fal image-to-image", prompt)
     _log_provider_prompt_lint("fal image-to-image", prompt)
 
     import os
@@ -668,6 +691,7 @@ async def _call_openai_image(
     from openai import AsyncOpenAI
 
     cfg = get_config()
+    _log_provider_prompt_debug("openai image", prompt)
     _log_provider_prompt_lint("openai image", prompt)
     response = await AsyncOpenAI(api_key=cfg.openai_api_key).images.generate(
         model="gpt-image-2",
@@ -694,6 +718,7 @@ async def _call_openai_image_edit(
     """Edit from a character reference using GPT Image 2."""
     from openai import AsyncOpenAI
 
+    _log_provider_prompt_debug("openai image-edit", prompt)
     _log_provider_prompt_lint("openai image-edit", prompt)
     if reference_image.startswith("http"):
         download_response = await client.get(
@@ -732,6 +757,7 @@ async def _call_replicate_image(
 ) -> str:
     """Fallback: Replicate SDXL for image generation."""
     cfg = get_config()
+    _log_provider_prompt_debug("replicate image", prompt)
     _log_provider_prompt_lint("replicate image", prompt)
     prompt = _sanitize_visual_prompt(prompt)
     payload = {
@@ -939,6 +965,7 @@ async def _call_seedance_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_debug("seedance video", prompt)
     _log_provider_prompt_lint("seedance video", prompt)
     prompt = _compact_provider_prompt(prompt)
     os.environ["FAL_KEY"] = _seedance_api_key(cfg)
@@ -972,6 +999,7 @@ async def _call_kling_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_debug("kling video", prompt)
     _log_provider_prompt_lint("kling video", prompt)
     os.environ["FAL_KEY"] = cfg.fal_key
     prompt = _compact_provider_prompt(prompt, 2400)
@@ -1005,6 +1033,7 @@ async def _call_runway_video(
 ) -> str:
     """Generate video via Runway Gen-3 Alpha Turbo API."""
     cfg = get_config()
+    _log_provider_prompt_debug("runway video", prompt)
     _log_provider_prompt_lint("runway video", prompt)
     runway_duration = 10 if duration_seconds > 5.0 else 5
     prompt = _compact_provider_prompt(prompt)
@@ -1170,6 +1199,7 @@ async def _call_seedance_image_to_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_debug("seedance image-to-video", prompt)
     _log_provider_prompt_lint("seedance image-to-video", prompt)
     os.environ["FAL_KEY"] = _seedance_api_key(cfg)
 
@@ -1218,6 +1248,7 @@ async def _call_kling_image_to_video(
     import fal_client as fal
 
     cfg = get_config()
+    _log_provider_prompt_debug("kling image-to-video", prompt)
     _log_provider_prompt_lint("kling image-to-video", prompt)
     os.environ["FAL_KEY"] = cfg.fal_key
     prompt = _compact_provider_prompt(prompt, 2400)

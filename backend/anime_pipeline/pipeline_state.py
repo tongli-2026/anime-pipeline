@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 from .cost_tracker import BudgetExceeded, add_costs, check_budget, zero_cost
 from .models import (
@@ -36,11 +38,16 @@ from .models import (
     PipelineState,
     PipelineStatus,
     QualityPreset,
+    Scene,
     SecondaryCharacter,
+    Shot,
     StageRecord,
     Story,
     UserInput,
 )
+from .normalizers import ensure_hybrid_keyframes
+from .prompt_builders import _collect_tts_script_lines
+from .quality import get_quality_profile
 
 # --------------------------------------------------------------
 # Factory
@@ -224,112 +231,264 @@ def deserialize_state(json_str: str) -> PipelineState:
 
 
 # --------------------------------------------------------------
-# Scene Prioritization — optimize video generation by budget
+# Shot-level budget allocation
 # --------------------------------------------------------------
 
-def prioritize_scenes_by_budget(
+
+@dataclass(frozen=True)
+class ShotBudgetAllocationSummary:
+    mandatory_floor_usd: float
+    reserved_image_floor_usd: float
+    reserved_tts_usd: float
+    reserved_composition_usd: float
+    remaining_for_hybrid_upgrades_usd: float
+    hybrid_shots: int
+    image_shots: int
+
+
+def _shot_has_live_frame(path: str | None) -> bool:
+    return bool(path) and Path(str(path)).is_file()
+
+
+def _shot_motion_utility(shot: Shot, scene: Scene | None) -> float:
+    purpose_weights = {
+        "action": 1.05,
+        "climax": 1.0,
+        "dialogue": 0.55,
+        "reaction": 0.5,
+        "establishing": 0.35,
+        "insert": 0.1,
+        "transition": 0.0,
+    }
+    utility = purpose_weights.get(shot.purpose, 0.4)
+    if shot.purpose in {"action", "climax"}:
+        utility += 0.25
+    if shot.camera_motion in {"tracking", "handheld", "push_in", "pull_out", "zoom"}:
+        utility += 0.28
+    elif shot.camera_motion in {"pan", "tilt"}:
+        utility += 0.14
+    if shot.shot_scale in {"close_up", "extreme_close_up"} and shot.purpose in {
+        "dialogue",
+        "reaction",
+    }:
+        utility += 0.16
+    if shot.continuity_mode != "cut":
+        utility += 0.14
+    if shot.keyframes.opening_frame_prompt or shot.keyframes.ending_frame_prompt:
+        utility += 0.18
+    if shot.dialogue:
+        utility += 0.05
+    if shot.inner_monologue:
+        utility += 0.06
+    utility += min(0.16, shot.duration_seconds / 20.0)
+    if scene is not None:
+        utility += min(0.28, scene.priority_score * 0.22)
+        if scene.is_action_heavy:
+            utility += 0.18
+    if shot.estimated_generation_mode == "hybrid":
+        utility += 0.08
+    return utility
+
+
+def _shot_hybrid_utility(shot: Shot, scene: Scene | None) -> float:
+    utility = _shot_motion_utility(shot, scene)
+    if shot.keyframes.opening_frame_prompt or shot.keyframes.ending_frame_prompt:
+        utility += 0.2
+    if shot.shot_scale in {"close_up", "extreme_close_up"}:
+        utility += 0.08
+    if shot.dialogue or shot.inner_monologue:
+        utility += 0.08
+    if shot.continuity_mode != "cut":
+        utility += 0.12
+    if shot.estimated_generation_mode == "hybrid":
+        utility += 0.12
+    return utility
+
+
+def allocate_shot_generation_budget(
     state: PipelineState,
     quality_preset: QualityPreset = "standard",
+    budget_mode: Literal["budget", "balanced", "quality"] = "balanced",
     video_provider: BillableVideoProvider = "seedance",
-) -> PipelineState:
+    *,
+    composition_reserve_usd: float = 0.12,
+) -> tuple[PipelineState, ShotBudgetAllocationSummary]:
     """
-    Adjust which scenes need video generation based on:
-    1. Agent's is_action_heavy and priority_score assessment
-    2. Available budget remaining
-    3. Cost of video vs image generation
+    Allocate remaining budget at the shot level after reserving mandatory spend.
 
-    Strategy: Greedy allocation
-    - Sort scenes by priority_score (descending)
-    - Assign video generation to high-priority action-heavy scenes until budget runs out
-    - Downgrade remaining scenes to image-only
+    The reserved floor keeps enough money for:
+      - fallback still images for every pending shot
+      - TTS synthesis
+      - a small FFmpeg/composition safety margin
 
-    Args:
-        state: Current PipelineState (must have story with scenes)
-        quality_preset: "draft", "standard", or "high" to determine provider quality
-        video_provider: Provider used for per-scene cost estimation
-
-    Returns:
-        New PipelineState with optimized scene.needs_video assignments
+    The remaining budget is then used to upgrade the highest-utility shots to
+    hybrid generation based on utility / incremental cost.
     """
-    from .cost_tracker import calc_image_cost, calc_video_cost
-    from .quality import get_quality_profile
+    from .cost_tracker import calc_image_cost, calc_tts_cost, calc_video_cost
 
-    if not state.story or not state.story.scenes:
-        return state
+    if state.shot_plan is None or not state.shot_plan.shots:
+        return state, ShotBudgetAllocationSummary(0.0, 0.0, 0.0, composition_reserve_usd, 0.0, 0, 0)
 
-    scenes = state.story.scenes[:]  # Make a mutable copy
+    shots = [shot.model_copy() for shot in state.shot_plan.shots]
+    pending_shots = [shot for shot in shots if shot.output is None]
+    if not pending_shots:
+        return state, ShotBudgetAllocationSummary(0.0, 0.0, 0.0, composition_reserve_usd, 0.0, 0, 0)
 
-    # Estimate per-scene costs (simplified, actual costs vary by duration)
-    # Video: ~5 second average clip
-    avg_video_duration_seconds = 5.0
-    quality_profile = get_quality_profile(quality_preset)
-    video_cost_per_scene = calc_video_cost(
-        avg_video_duration_seconds,
-        provider=video_provider,
-        quality=quality_profile.video_quality,
-        resolution=quality_profile.video_resolution,
+    profile = get_quality_profile(quality_preset)
+    image_quality = profile.image_quality
+    image_provider: Literal["fal", "openai"] = (
+        "fal" if quality_preset == "draft" or budget_mode == "budget" else "openai"
     )
-    image_cost_per_scene = calc_image_cost(
-        count=1,
-        quality="hd" if quality_preset == "high" else "standard"
+    scene_lookup = {
+        scene.id: scene for scene in (state.story.scenes if state.story else [])
+    }
+
+    reserved_image_floor = calc_image_cost(
+        len(pending_shots),
+        image_quality,
+        image_provider,
+    ).total_cost_usd
+
+    tts_lines = _collect_tts_script_lines(state)
+    tts_characters = sum(
+        len(str(line.get("text", "")).strip()) for line in tts_lines if str(line.get("text", "")).strip()
     )
+    reserved_tts = calc_tts_cost(
+        tts_characters,
+        provider="auto",
+        budget_mode=budget_mode,
+        quality=image_quality,
+    ).total_cost_usd
 
-    # Reserve budget for LLM stages that run AFTER this point (TTS, composition, etc.)
-    # Estimate: ~$0.30 for remaining LLM + TTS regardless of scene count
-    RESERVED_FOR_LLM_TTS = 0.50
+    mandatory_floor = (
+        state.total_cost.total_cost_usd
+        + reserved_image_floor
+        + reserved_tts
+        + composition_reserve_usd
+    )
+    remaining_for_upgrades = max(0.0, state.budget.hard_limit_usd - mandatory_floor)
 
-    # Available budget: hard limit minus current spend, minus LLM/TTS reserve
-    available = state.budget.hard_limit_usd - state.total_cost.total_cost_usd - RESERVED_FOR_LLM_TTS
-    if available <= 0:
-        # Already over budget, no videos
-        for s in scenes:
-            s.needs_video = False
-        updated_story = state.story.model_copy(update={"scenes": scenes})
-        return state.model_copy(update={"story": updated_story})
+    base_image_cost = calc_image_cost(1, image_quality, image_provider).total_cost_usd
+    candidates: list[tuple[float, float, float, str, Literal["hybrid"]]] = []
 
-    # Hard cap: set to 0 to use Ken Burns image-only mode (no video API costs)
-    # Set to 1-3 to enable video generation for top-priority scenes
-    MAX_VIDEO_SCENES = 0
+    for shot in pending_shots:
+        parent_scene = scene_lookup.get(shot.scene_id or "")
+        if shot.purpose in {"insert", "transition"}:
+            continue
+        preferred_mode = shot.estimated_generation_mode
+        video_cost = calc_video_cost(
+            shot.duration_seconds,
+            provider=video_provider,
+            quality=profile.video_quality,
+            resolution=profile.video_resolution,
+        ).total_cost_usd
+        keyframe_images = 2
+        if _shot_has_live_frame(shot.opening_frame_path):
+            keyframe_images -= 1
+        if _shot_has_live_frame(shot.ending_frame_path):
+            keyframe_images -= 1
+        keyframe_images = max(0, keyframe_images)
 
-    budget_for_scenes = available
-
-    # Create (index, scene, combined_score) tuples for sorting
-    # Combined score = is_action_heavy * 0.4 + priority_score * 0.6
-    # (prioritize narrative importance slightly more than action)
-    scene_priorities = [
-        (
-            i,
-            s,
-            (float(s.is_action_heavy) * 0.4) + (s.priority_score * 0.6),
+        hybrid_increment = max(
+            0.0,
+            video_cost
+            + calc_image_cost(keyframe_images, image_quality, image_provider).total_cost_usd
+            - base_image_cost,
         )
-        for i, s in enumerate(scenes)
-    ]
-    
-    # Sort by combined score descending (highest priority first)
-    scene_priorities.sort(key=lambda x: x[2], reverse=True)
-    
-    # Greedy allocation: assign video to highest-priority action-heavy scenes
-    budget_remaining = budget_for_scenes
-    video_count = 0
-    image_count = 0
+        if hybrid_increment > 0 and preferred_mode in {"image", "hybrid"}:
+            hybrid_utility = _shot_hybrid_utility(shot, parent_scene)
+            candidates.append(
+                (
+                    hybrid_utility / hybrid_increment,
+                    hybrid_utility,
+                    hybrid_increment,
+                    shot.id,
+                    "hybrid",
+                )
+            )
 
-    for idx, scene, combined_score in scene_priorities:
-        # Assign video to action-heavy scenes OR high-priority emotional climax scenes
-        is_video_candidate = scene.is_action_heavy or scene.priority_score >= 0.8
-        if (
-            is_video_candidate
-            and video_count < MAX_VIDEO_SCENES
-            and budget_remaining >= video_cost_per_scene.total_cost_usd
-        ):
-            scenes[idx].needs_video = True
-            budget_remaining -= video_cost_per_scene.total_cost_usd
-            video_count += 1
+    candidates.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
+    chosen_modes: dict[str, Literal["hybrid"]] = {}
+    budget_remaining = remaining_for_upgrades
+    for ratio, utility, cost, shot_id, mode in candidates:
+        if shot_id in chosen_modes or budget_remaining < cost:
+            continue
+        chosen_modes[shot_id] = mode
+        budget_remaining -= cost
+
+    updated_shots: list[Shot] = []
+    hybrid_shots = 0
+    image_shots = 0
+    for shot in shots:
+        if shot.output is not None:
+            updated_shots.append(shot)
+            continue
+
+        chosen_mode = chosen_modes.get(shot.id, "image")
+        if chosen_mode == "hybrid":
+            normalized = ensure_hybrid_keyframes(
+                shot.model_dump(mode="python"),
+                scene_lookup.get(shot.scene_id or ""),
+            )
+            shot = Shot.model_validate(
+                {
+                    **normalized,
+                    "estimated_generation_mode": "hybrid",
+                }
+            )
+            hybrid_shots += 1
         else:
-            # Otherwise, downgrade to image-only
-            scenes[idx].needs_video = False
-            budget_remaining -= image_cost_per_scene.total_cost_usd
-            image_count += 1
-    
-    # Update state with optimized scene assignments
-    updated_story = state.story.model_copy(update={"scenes": scenes})
-    return state.model_copy(update={"story": updated_story, "updated_at": time.time()})
+            shot = shot.model_copy(update={"estimated_generation_mode": "image"})
+            image_shots += 1
+        updated_shots.append(shot)
+
+    updated_scene_lookup: dict[str, list[Shot]] = {}
+    for shot in updated_shots:
+        if shot.scene_id:
+            updated_scene_lookup.setdefault(shot.scene_id, []).append(shot)
+    updated_story: Story | None
+    if state.story is not None:
+        updated_scenes = []
+        for scene in state.story.scenes:
+            scene_shots = updated_scene_lookup.get(scene.id, [])
+            needs_video = any(shot.estimated_generation_mode == "hybrid" for shot in scene_shots)
+            updated_scenes.append(
+                scene.model_copy(
+                    update={
+                        "shots": scene_shots,
+                        "needs_video": needs_video,
+                    }
+                )
+            )
+        updated_story = state.story.model_copy(update={"scenes": updated_scenes})
+    else:
+        updated_story = None
+
+    notes = list(state.shot_plan.notes)
+    notes.append(
+        "Shot budget allocation reserved "
+        f"${reserved_image_floor + reserved_tts + composition_reserve_usd:.2f} "
+        f"for mandatory assets and kept ${remaining_for_upgrades:.2f} for hybrid upgrades."
+    )
+    notes.append(f"Allocated {hybrid_shots} hybrid and {image_shots} image shots.")
+    updated_shot_plan = state.shot_plan.model_copy(
+        update={"shots": updated_shots, "notes": notes}
+    )
+
+    updated_state = state.model_copy(
+        update={
+            "story": updated_story,
+            "shot_plan": updated_shot_plan,
+            "updated_at": time.time(),
+        }
+    )
+    summary = ShotBudgetAllocationSummary(
+        mandatory_floor_usd=mandatory_floor,
+        reserved_image_floor_usd=reserved_image_floor,
+        reserved_tts_usd=reserved_tts,
+        reserved_composition_usd=composition_reserve_usd,
+        remaining_for_hybrid_upgrades_usd=remaining_for_upgrades,
+        hybrid_shots=hybrid_shots,
+        image_shots=image_shots,
+    )
+    return updated_state, summary

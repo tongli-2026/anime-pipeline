@@ -7,7 +7,7 @@
 #   - Resolve character name → id mappings and populate CharacterState slots.
 #   - Normalize dialogue and inner-monologue items into typed payloads suitable
 #     for TTS generation and timeline composition.
-#   - Decide generation mode heuristically (`image` / `video` / `hybrid`) and
+#   - Decide generation mode heuristically (`image` / `hybrid`) and
 #     ensure hybrid shots include stable keyframe prompts for continuity.
 #   - Provide tolerant parsing helpers that accept legacy stringified dicts,
 #     simple strings, or structured JSON-like payloads from LLM outputs.
@@ -17,7 +17,7 @@
 #     extract normalized `dialogue`, `inner_monologue`, and `characters` slots.
 #   - `normalize_shot(raw, scene_lookup, char_name_to_id)` — normalize shot
 #     properties, literal values, and character anchors.
-#   - `decide_generation_mode(out, scene)` — heuristic to pick `image`/`video`/`hybrid`.
+#   - `decide_generation_mode(out, scene)` — heuristic to pick `image`/`hybrid`.
 #   - `ensure_hybrid_keyframes(out, scene)` — fill missing keyframe prompts for
 #     hybrid shots.
 #   - `build_timeline_plan_from_shots(shots, story_id)` — build a `TimelinePlan`
@@ -224,11 +224,18 @@ def normalize_scene(
             if not cid:
                 name_hint = slot.get("name", "") or slot.get("state", {}).get("name", "")
                 cid = _resolve_id(name_hint)
-                slot = {
-                    **slot,
-                    "character_id": cid,
-                    "state": {**slot["state"], "character_id": cid},
+            state_payload = slot.get("state", {})
+            if isinstance(state_payload, dict):
+                state_dict = dict(state_payload)
+            else:
+                state_dict = {
+                    "action": str(state_payload).strip() or "standing",
                 }
+            slot = {
+                **slot,
+                "character_id": cid,
+                "state": {**state_dict, "character_id": cid},
+            }
         else:
             cid = c.get("character_id", "") or _resolve_id(c.get("name", ""))
             state_dict = {
@@ -290,9 +297,6 @@ def decide_generation_mode(out: dict[str, Any], scene: Scene | None) -> str:
         out.get("keyframes", {}).get("opening_frame_prompt")
         or out.get("keyframes", {}).get("ending_frame_prompt")
     )
-    parent_needs_video = bool(scene.needs_video) if scene is not None else False
-    parent_is_key = bool(scene.type == "key") if scene is not None else False
-
     if purpose in {"insert", "transition"}:
         return "image"
     if purpose == "establishing" and duration <= 4.0 and camera_motion in {"static", "pan", "tilt"}:
@@ -300,19 +304,17 @@ def decide_generation_mode(out: dict[str, Any], scene: Scene | None) -> str:
     if purpose == "reaction" and duration <= 3.5 and shot_scale in {"close_up", "extreme_close_up"}:
         return "image"
     if purpose in {"action", "climax"}:
-        return "hybrid" if has_keyframes or duration >= 3.0 else "video"
+        return "hybrid"
     if purpose == "dialogue":
         if has_keyframes or shot_scale in {"close_up", "extreme_close_up"} or has_inner_monologue:
             return "hybrid"
-        return "image" if duration <= 4.0 else "video"
+        return "image" if duration <= 4.0 else "hybrid"
     if purpose == "reaction" and has_inner_monologue:
         return "hybrid"
-    if parent_needs_video or parent_is_key:
-        return "hybrid" if has_keyframes else "video"
     if has_dialogue or has_inner_monologue:
         return "hybrid" if has_keyframes else "image"
     if camera_motion not in {"static", "pan", "tilt"} or duration > 5.0:
-        return "video"
+        return "hybrid"
     return "image"
 
 
@@ -440,7 +442,13 @@ def normalize_shot(
             cid = c.get("character_id") or _resolve_id(
                 c.get("name", "") or c.get("state", {}).get("name", "")
             )
-            state = dict(c.get("state", {}))
+            state_payload = c.get("state", {})
+            if isinstance(state_payload, dict):
+                state = dict(state_payload)
+            else:
+                state = {
+                    "action": str(state_payload).strip() or "standing",
+                }
             state.setdefault("character_id", cid)
             state.setdefault("expression", "neutral")
             state.setdefault("action", "standing")

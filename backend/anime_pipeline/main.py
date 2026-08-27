@@ -42,7 +42,9 @@ from .checkpoint_system import AutoResolver, CLIResolver
 from .env import get_config, load_project_environment, print_capabilities_report
 from .models import PipelineState, PrimaryCharacterInput, QualityPreset, UserInput
 from .pipeline_orchestrator import PipelineOptions, run_from_state, run_pipeline
+from .output_paths import get_run_output_root
 from .pipeline_state import deserialize_state, serialize_state
+from .tools.image_gen import set_debug_prompts
 
 load_project_environment()
 get_config.cache_clear()
@@ -149,6 +151,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["draft", "standard", "high"],
         help="Output quality used consistently for images, video, and final encoding.",
     )
+    parser.add_argument(
+        "--output-root",
+        help="Base directory for this run's artifacts. A run_id subfolder is created under it.",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="Print full provider prompts before they are sent.",
+    )
     return parser
 
 
@@ -169,6 +180,7 @@ async def _run() -> None:
 
     args = _build_parser().parse_args()
     console = Console()
+    set_debug_prompts(args.debug_prompts)
     console.print(Panel(
         "[bold magenta]🎬 Anime Generation Pipeline[/bold magenta]",
         expand=False,
@@ -266,6 +278,11 @@ async def _run() -> None:
         budget_mode=budget_mode,  # type: ignore[arg-type]
         video_provider=video_provider,  # type: ignore[arg-type]
         tts_provider=tts_provider,  # type: ignore[arg-type]
+        output_root=(
+            Path(args.output_root).expanduser()
+            if args.output_root
+            else (Path(args.state_file).resolve().parent if args.state_file else None)
+        ),
     )
     if state:
         final_state = await run_from_state(state, resolver, options)
@@ -273,8 +290,8 @@ async def _run() -> None:
         final_state = await run_pipeline(user_input, resolver, options)
 
     # Persist final state for potential resume
-    output_dir = Path("./output")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = get_run_output_root()
+    output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / f"state_{final_state.id[:8]}.json"
     state_path.write_text(serialize_state(final_state))
     console.print(f"\n[dim]State saved → {state_path}[/dim]")

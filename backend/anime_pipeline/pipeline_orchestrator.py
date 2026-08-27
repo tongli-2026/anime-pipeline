@@ -1,15 +1,17 @@
 # ==============================================================
 # Pipeline Orchestrator — the central coordinator
 #
-# Runs the 8-stage pipeline sequentially:
+# Runs the 10-stage pipeline sequentially:
 #   1. Character Proposal → User selects → Lock characters
-#   2. Story Generation
-#   3. Scene Breakdown
-#   4. Secondary Characters (optional checkpoint)
-#   5. Scene Prompt Building
-#   6. Generation (image/video per scene, parallel)
-#   7. TTS Audio Script
-#   8. Video Composition (FFmpeg)
+#   2. Reference Pack Generation
+#   3. Story Generation
+#   4. Scene Breakdown
+#   5. Shot Planning
+#   6. Secondary Characters (optional checkpoint)
+#   7. Scene Prompt Building
+#   8. Generation (image/hybrid per shot, parallel)
+#   9. TTS Audio Script
+#   10. Video Composition (FFmpeg)
 #
 # Design patterns:
 #   - Explicit immutable state object (updated via model_copy)
@@ -121,16 +123,16 @@ from .prompt_builders import (
     _run_scene_prompt_builder,
     _serialize_scene_prompt_builder_shot,  # noqa: F401
 )
-from .quality import get_quality_profile
-from .tools.ffmpeg_compose import compose_video
+from .output_paths import get_run_output_root
+from .tools.ffmpeg_compose import compose_video, set_output_root as set_ffmpeg_output_root
 from .tools.image_gen import (
     generate_character_images,
     generate_character_reference_pack,
     generate_scene_image,
-    generate_scene_video,
     generate_shot_hybrid,
+    set_output_root as set_image_output_root,
 )
-from .tools.tts_gen import TTSLine, generate_tts
+from .tools.tts_gen import TTSLine, generate_tts, set_output_root as set_tts_output_root
 from .voice_profiles import ensure_character_voice_profiles, resolve_voice_profile_for_line
 
 console = Console()
@@ -153,10 +155,26 @@ def _resolve_budget(user_input: UserInput, options: PipelineOptions) -> BudgetCo
 
 
 def _persist_state_snapshot(state: PipelineState) -> None:
-    output_dir = Path("./output")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = get_run_output_root()
+    output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / f"state_{state.id[:8]}.json"
     state_path.write_text(serialize_state(state))
+
+
+def set_run_output_root(output_root: str | Path) -> Path:
+    """Set the shared run output root used by all artifact-producing stages."""
+    root = Path(output_root).expanduser()
+    set_image_output_root(root)
+    set_tts_output_root(root)
+    set_ffmpeg_output_root(root)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _prepare_run_output_root(state: PipelineState, options: PipelineOptions) -> Path:
+    """Ensure the current run writes into a dedicated run-scoped directory."""
+    root = options.output_root or (Path("./output/runs") / state.id[:8])
+    return set_run_output_root(root)
 
 
 def _apply_cost_and_persist_state(state: PipelineState, cost: CostRecord) -> PipelineState:
@@ -242,7 +260,7 @@ class PipelineOptions:
     Field precedence and purpose:
         - `budget`: Optional `BudgetConfig` override. If not provided, `UserInput.budget`
             is used, then environment defaults.
-        - `quality_preset`: One of `draft`, `standard`, or `high`. Controls image/video
+        - `quality_preset`: One of `draft`, `standard`, or `high`. Controls image/hybrid
             generation fidelity and influences cost estimates.
         - `budget_mode`: Provider-selection hint used by generators to favor cheaper
             or higher-quality providers (`budget`, `balanced`, `quality`). This is a
@@ -273,6 +291,7 @@ class PipelineOptions:
     tts_provider: Literal["auto", "openai", "google", "elevenlabs"] = "auto"
     min_video_duration_seconds: float = 4.0
     max_video_duration_seconds: float = 12.0
+    output_root: Path | None = None
 
 
 def _apply_scene_review_resolution(
@@ -672,20 +691,22 @@ async def run_pipeline(
     options: PipelineOptions | None = None,
 ) -> PipelineState:
     """
-    Execute the full 8-stage anime generation pipeline.
+    Execute the full 10-stage anime generation pipeline.
 
     Stages:
       1. Character Proposal       (LLM + image gen)
       [Checkpoint: user selects characters]
-      2. Story Generation         (LLM)
-      3. Scene Breakdown          (LLM)
+      2. Reference Pack Generation (image gen)
+      3. Story Generation         (LLM)
+      4. Scene Breakdown          (LLM)
       [Optional checkpoint: scene review]
-      4. Secondary Characters     (LLM)
+      5. Shot Planning            (LLM)
+      6. Secondary Characters     (LLM)
       [Optional checkpoint: secondary char review]
-      5. Scene Prompt Building    (LLM)
-      6. Generation               (image/video per scene)
-      7. TTS Audio                (LLM script + TTS API)
-      8. Video Composition        (ffmpeg, local)
+      7. Scene Prompt Building    (LLM)
+      8. Generation               (image/hybrid per shot)
+      9. TTS Audio                (LLM script + TTS API)
+      10. Video Composition       (ffmpeg, local)
     """
     if options is None:
         options = PipelineOptions()
@@ -697,6 +718,7 @@ async def run_pipeline(
         update={"quality_preset": options.quality_preset}
     )
     state = create_initial_state(user_input, budget)
+    _prepare_run_output_root(state, options)
 
     # Pre-flight cost estimate
     if not options.dry_run:
@@ -939,43 +961,7 @@ async def run_pipeline(
                     )
                     return transition_to(state, state.current_stage, "paused")
 
-        # ── Stage 4.5: Scene Prioritization by Budget ────────
-        # Based on is_action_heavy and priority_score, optimize which scenes
-        # should be videos vs images to fit within the budget
-        from .pipeline_state import prioritize_scenes_by_budget
-
-        estimated_video_provider = (
-            "seedance" if options.video_provider == "auto" else options.video_provider
-        )
-        state = prioritize_scenes_by_budget(
-            state,
-            options.quality_preset,
-            estimated_video_provider,
-        )
-
-        # Display the optimized scene distribution
-        video_scenes = [s for s in state.story.scenes if s.needs_video]  # type: ignore[union-attr]
-        image_scenes = [s for s in state.story.scenes if not s.needs_video]  # type: ignore[union-attr]
-        from .cost_tracker import calc_image_cost, calc_video_cost
-
-        quality_profile = get_quality_profile(options.quality_preset)
-        video_quality = quality_profile.video_quality
-        est_vid_cost = len(video_scenes) * calc_video_cost(
-            5.0,
-            estimated_video_provider,
-            quality=video_quality,
-            resolution=quality_profile.video_resolution,
-        ).total_cost_usd
-        est_img_cost = len(image_scenes) * calc_image_cost(1, "standard").total_cost_usd
-        console.print("\n[bold]🎬 Scene Distribution (optimized by budget):[/bold]")
-        console.print(
-            f"  [green]Videos:[/green] {len(video_scenes)} scenes  (est. ${est_vid_cost:.2f})"
-        )
-        console.print(
-            f"  [cyan]Images:[/cyan]  {len(image_scenes)} scenes  (est. ${est_img_cost:.3f})"
-        )
-
-        # ── Stage 4.6: Shot Planning ──────────────────────────
+        # ── Stage 5: Shot Planning ──────────────────────────
         state = transition_to(state, "shot_planning")
         stage_start = time.monotonic()
 
@@ -1105,7 +1091,7 @@ async def run_pipeline(
                 )
             raise
 
-        # ── Stage 5: Secondary Characters ────────────────────
+        # ── Stage 6: Secondary Characters ────────────────────
         state = transition_to(state, "secondary_characters")
         stage_start = time.monotonic()
 
@@ -1182,7 +1168,7 @@ async def run_pipeline(
             (time.monotonic() - stage_start) * 1000,
         )
 
-        # ── Stage 6: Scene Prompt Building ───────────────────
+        # ── Stage 7: Scene Prompt Building ───────────────────
         state = transition_to(state, "scene_prompt_build")
         stage_start = time.monotonic()
 
@@ -1224,10 +1210,15 @@ async def run_pipeline(
             console.print("\n[bold green]🏃 Dry run complete. No assets generated.[/bold green]")
             return transition_to(state, "complete", "completed")
 
+        # ── Stage 8: Generation ─────────────────────────────────────
         state = await _run_generation_stage(state, resolver, options)
         if state.status == "aborted":
             return state
+
+        # ── Stage 9: TTS Audio Script ──────────────────────────────
         state = await _run_tts_stage(state, client, options)
+
+        # ── Stage 10: Video Composition ────────────────────────────
         state, output_path = await _run_video_composition_stage(state)
 
         console.print("\n[bold green]🎬 Pipeline complete![/bold green]")
@@ -1282,39 +1273,6 @@ async def run_from_scene_breakdown_state(
     client = create_llm_router()
 
     try:
-        # ── Scene Prioritization by Budget ───────────────────
-        from .pipeline_state import prioritize_scenes_by_budget
-
-        estimated_video_provider = (
-            "seedance" if options.video_provider == "auto" else options.video_provider
-        )
-        state = prioritize_scenes_by_budget(
-            state,
-            options.quality_preset,
-            estimated_video_provider,
-        )
-
-        video_scenes = [s for s in state.story.scenes if s.needs_video]  # type: ignore[union-attr]
-        image_scenes = [s for s in state.story.scenes if not s.needs_video]  # type: ignore[union-attr]
-        from .cost_tracker import calc_image_cost, calc_video_cost
-
-        quality_profile = get_quality_profile(options.quality_preset)
-        video_quality = quality_profile.video_quality
-        est_vid_cost = len(video_scenes) * calc_video_cost(
-            5.0,
-            estimated_video_provider,
-            quality=video_quality,
-            resolution=quality_profile.video_resolution,
-        ).total_cost_usd
-        est_img_cost = len(image_scenes) * calc_image_cost(1, "standard").total_cost_usd
-        console.print("\n[bold]🎬 Scene Distribution (optimized by budget):[/bold]")
-        console.print(
-            f"  [green]Videos:[/green] {len(video_scenes)} scenes  (est. ${est_vid_cost:.2f})"
-        )
-        console.print(
-            f"  [cyan]Images:[/cyan]  {len(image_scenes)} scenes  (est. ${est_img_cost:.3f})"
-        )
-
         # ── Shot Planning ────────────────────────────────────
         console.print("\n[bold]🎬 Starting Shot Planning...[/bold]")
         state = transition_to(state, "shot_planning")
@@ -1516,6 +1474,8 @@ async def run_from_state(
     if options is None:
         options = PipelineOptions()
 
+    _prepare_run_output_root(state, options)
+
     if state.current_stage in GENERATION_RESUME_STAGES:
         return await run_from_generation_state(state, resolver, options)
     return await run_from_scene_breakdown_state(state, resolver, options)
@@ -1611,6 +1571,37 @@ async def _run_generation_stage(
         shot_plan = state.shot_plan
         scene_lookup = {scene.id: scene for scene in (state.story.scenes if state.story else [])}
         if not state.generation_units:
+            from .pipeline_state import allocate_shot_generation_budget
+
+            estimated_video_provider = (
+                "seedance" if options.video_provider == "auto" else options.video_provider
+            )
+            state, allocation = allocate_shot_generation_budget(
+                state,
+                options.quality_preset,
+                options.budget_mode,
+                estimated_video_provider,
+            )
+            if state.shot_plan is None:
+                raise RuntimeError("Shot plan missing after budget allocation")
+            shot_plan = state.shot_plan
+            console.print("\n[bold]💸 Shot budget allocation:[/bold]")
+            console.print(
+                "  [dim]Mandatory floor:[/dim] "
+                f"${allocation.mandatory_floor_usd:.2f} "
+                f"(images ${allocation.reserved_image_floor_usd:.2f}, "
+                f"TTS ${allocation.reserved_tts_usd:.2f}, "
+                f"composition ${allocation.reserved_composition_usd:.2f})"
+            )
+            console.print(
+                "  [dim]Remaining for hybrid upgrades:[/dim] "
+                f"${allocation.remaining_for_hybrid_upgrades_usd:.2f}"
+            )
+            console.print(
+                "  [dim]Chosen modes:[/dim] "
+                f"{allocation.hybrid_shots} hybrid, "
+                f"{allocation.image_shots} image"
+            )
             generation_units = build_generation_units(
                 shot_plan.shots,
                 min_duration_seconds=options.min_video_duration_seconds,
@@ -1713,15 +1704,6 @@ async def _run_generation_stage(
                             "ending_frame_path": previous_ending_path,
                         }
                     )
-                elif shot.estimated_generation_mode == "video":
-                    console.print("[dim]  Creating text-to-video clip...[/dim]")
-                    file_path, cost = await generate_scene_video(
-                        generation_scene,
-                        options.quality_preset,
-                        video_provider=options.video_provider,
-                        budget_mode=options.budget_mode,
-                    )
-                    output = VideoOutput(file_path=file_path, cost=cost)
                 else:
                     console.print("[dim]  Creating still image...[/dim]")
                     file_path, cost = await generate_scene_image(
@@ -1775,9 +1757,50 @@ async def _run_generation_stage(
                 continue
 
             if scene.type == "key" and scene.needs_video:
-                console.print(f"[cyan]→ Generating video scene[/cyan] {scene.id} ({scene.duration_seconds:.1f}s)")
-                file_path, cost = await generate_scene_video(
-                    scene,
+                console.print(
+                    f"[cyan]→ Generating hybrid scene[/cyan] {scene.id} "
+                    f"({scene.duration_seconds:.1f}s)"
+                )
+                synthetic_shot = Shot.model_validate(
+                    {
+                        "id": scene.id,
+                        "index": scene.index,
+                        "scene_id": scene.id,
+                        "purpose": "action" if scene.is_action_heavy else "dialogue",
+                        "duration_seconds": scene.duration_seconds,
+                        "shot_scale": "wide" if scene.is_action_heavy else "medium",
+                        "camera_angle": "eye_level",
+                        "camera_motion": "tracking" if scene.is_action_heavy else "static",
+                        "location": scene.location,
+                        "time_of_day": scene.time_of_day,
+                        "mood": scene.mood,
+                        "visual_intent": scene.description,
+                        "action_description": scene.description,
+                        "characters": [
+                            {
+                                "character_id": character.character_id,
+                                "state": character.state.model_dump(mode="python"),
+                            }
+                            for character in scene.characters
+                        ],
+                        "dialogue": scene.dialogue,
+                        "inner_monologue": scene.inner_monologue,
+                        "audio_cues": scene.audio_cues,
+                        "keyframes": {
+                            "opening_frame_prompt": (
+                                f"{scene.title}: {scene.description} opening frame, "
+                                f"{scene.location}, {scene.time_of_day}, {scene.mood}"
+                            ),
+                            "ending_frame_prompt": (
+                                f"{scene.title}: {scene.description} ending frame, "
+                                f"{scene.location}, {scene.time_of_day}, {scene.mood}"
+                            ),
+                        },
+                        "estimated_generation_mode": "hybrid",
+                    }
+                )
+                file_path, cost, keyframe_paths, _hybrid_metadata = await generate_shot_hybrid(
+                    synthetic_shot,
                     options.quality_preset,
                     video_provider=options.video_provider,
                     budget_mode=options.budget_mode,

@@ -1,0 +1,26 @@
+{
+  "concept": "Thirty Seconds of Static: after-school club-room blackout turns a rehearsed confession into an awkward comic misunderstanding that still lands as a real romantic beat.",
+  "story_outline": "[0-12s] In a cramped old club room bathed in sunset, Lu adjusts a dusty Tesla coil and a stack of strange club equipment while Rin sits by the window reading a thick novel. The room feels calm, retro, and slightly absurd, with the last warm light catching the edge of her face. [12-25s] Lu takes a breath, lifts the switch, and proudly announces that his experiment will 'test the darkness generator.' The whole building cuts out at once. The club room falls into near-total blackness, leaving only the window glow and the outline of Rin's book. Lu freezes, clutching the confession letter he has hidden in his pocket, then starts walking toward the window in the dark. [25-40s] Their hands brush in the darkness. Both stop. A flash of lightning briefly reveals Rin's surprised expression, then the room goes dark again. Lu finds the courage to take her hand and begins to confess, only for the sound of boots and a stern voice to interrupt the moment from the doorway. [40-50s] The power comes back with a harsh flicker. Lu realizes he is not holding Rin's hand at all, but the principal's wrist, because the teacher had stepped in to inspect the blackout. Rin is standing behind the principal, trying not to laugh, still holding her book against her chest. The principal orders Lu to the office for tampering with the school's power. [50-60s] As Lu is escorted away, he drops the confession letter. Rin picks it up after the door closes, slips it into the middle of her book, and looks after him with a small, knowing smile. She murmurs one quiet word that lands like a reply. End on the book closing over the letter as rain begins outside the window. Keep the romance understated, the comedy visual, and the action easy to read in full-frame shots.",
+  "style": "retro Japanese school anime with subtle film grain, warm sunset-to-blackout contrast, rainy pre-storm atmosphere, compact club-room staging, expressive but restrained facial acting, awkward romantic comedy with a sincere ending, clean full-frame 16:9 compositions, clear visual cause and effect, no narration, no inner monologue, no storyboard panels, no split screens, no collage layouts, no caption overlays, no sexualized framing",
+  "target_duration_seconds": 60,
+  "budget": {
+    "hard_limit_usd": 5.0,
+    "warn_at_usd": 3.5
+  },
+  "primary_characters": [
+    {
+      "name": "Lu",
+      "description": "High-school-aged boy with short dark hair, slightly messy bangs, bright expressive eyes, a thin navy school blazer, white shirt, loosened tie, and a camera strap hanging from one shoulder.",
+      "personality": "Earnest, awkward, imaginative, and proud of his weird club experiments, but secretly very sensitive and easy to fluster.",
+      "motivation": "He wants to use the blackout experiment as an excuse to confess to Rin before he loses his nerve.",
+      "relationship_to_others": "He admires Rin from across the club room and keeps finding indirect ways to talk to her. His feelings are obvious to the audience long before he can say them out loud."
+    },
+    {
+      "name": "Rin",
+      "description": "High-school-aged girl with straight dark hair, calm eyes, a neat school uniform, and a thick worn novel always in hand.",
+      "personality": "Quiet, observant, dryly amused, and harder to read than she first appears.",
+      "motivation": "She wants to see what Lu is really trying to do and whether his strange experiment has a real purpose behind it.",
+      "relationship_to_others": "She notices Lu's nervousness from the beginning and gradually lets him see that she is paying attention. Her final reaction should feel warm, teasing, and just a little shy."
+    }
+  ]
+}

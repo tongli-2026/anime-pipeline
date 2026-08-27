@@ -15,7 +15,7 @@ backend/
     ├── agent_definitions.py    # agent system prompts + model tiers
     ├── agent_runner.py         # multi-provider LLM router with retry/fallback
     ├── checkpoint_system.py    # human-in-the-loop checkpoint resolver
-    ├── pipeline_orchestrator.py# 8-stage pipeline coordinator
+    ├── pipeline_orchestrator.py# 10-stage pipeline coordinator
     ├── normalizers.py          # LLM output normalization + shot mode decisions
     ├── prompt_builders.py      # prompt construction + prompt batch runner
     ├── main.py                 # CLI entry point

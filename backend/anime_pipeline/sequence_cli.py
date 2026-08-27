@@ -2,7 +2,7 @@
 # Sequence CLI — per-scene shot generator and composer
 #
 # Small CLI for generating and composing all shots that belong to a single
-# `Scene`. It orchestrates per-shot generation (image, video, or hybrid) and
+# `Scene`. It orchestrates per-shot generation (image or hybrid) and
 # composes the final MP4, while preserving visual continuity between adjacent
 # shots using the pipeline's continuity heuristics.
 #
@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -38,13 +39,14 @@ from .models import ImageOutput, Scene, Shot, VideoOutput, VideoProvider
 from .pipeline_orchestrator import (
     _build_generation_scene_from_shot,
     _resolve_shot_continuity,
+    set_run_output_root,
 )
 from .shot_cli import build_example_shot
 from .tools.ffmpeg_compose import compose_shots
 from .tools.image_gen import (
     generate_scene_image,
-    generate_scene_video,
     generate_shot_hybrid,
+    set_debug_prompts,
 )
 
 load_project_environment()
@@ -187,15 +189,6 @@ async def generate_scene_sequence(
                     "ending_frame_path": previous_ending_path,
                 }
             )
-        elif shot.estimated_generation_mode == "video":
-            media_path, cost = await generate_scene_video(
-                generation_scene,
-                quality_preset,
-                video_provider=video_provider,
-                budget_mode=budget_mode,
-            )
-            output = VideoOutput(file_path=media_path, cost=cost)
-            previous_ending_path = None
         else:
             media_path, cost = await generate_scene_image(
                 generation_scene, quality_preset, budget_mode
@@ -257,6 +250,7 @@ async def generate_scene_sequence(
 
 async def _run(args: argparse.Namespace) -> None:
     console = Console()
+    set_debug_prompts(args.debug_prompts)
     if args.print_example:
         console.print_json(data=build_example_scene().model_dump())
         return
@@ -268,6 +262,9 @@ async def _run(args: argparse.Namespace) -> None:
     if args.show_capabilities:
         print_capabilities_report()
         return
+
+    run_root = Path(args.output_root).expanduser() if args.output_root else Path("./output/runs") / uuid.uuid4().hex[:8]
+    set_run_output_root(run_root)
 
     scene = load_scene_from_file(Path(args.scene_file)) if args.scene_file else build_example_scene()
     console.print(Panel("[bold magenta]Scene Shot Sequence Generator[/bold magenta]", expand=False))
@@ -301,6 +298,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", help="Write result metadata to this JSON file.")
     parser.add_argument("--output-video", help="Final composed MP4 path.")
     parser.add_argument("--hard-limit", type=float, help="Abort after exceeding this USD amount.")
+    parser.add_argument(
+        "--output-root",
+        help="Base directory for this run's artifacts. A run_id subfolder is created under it.",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="Print full provider prompts before they are sent.",
+    )
     parser.add_argument(
         "--min-video-duration",
         type=float,

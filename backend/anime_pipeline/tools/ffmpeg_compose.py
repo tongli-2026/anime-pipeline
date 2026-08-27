@@ -28,12 +28,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..cost_tracker import zero_cost
+from ..output_paths import get_run_output_root, set_run_output_root
 from ..models import CostRecord, PipelineState, QualityPreset, Scene, Shot
 from ..quality import get_quality_profile
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = Path("./output")
+OUTPUT_DIR = get_run_output_root()
+
+
+def set_output_root(output_root: str | Path) -> Path:
+    """Point final composition output at a run-scoped directory."""
+    global OUTPUT_DIR
+    root = set_run_output_root(output_root)
+    OUTPUT_DIR = root
+    return root
 
 # Check if ffmpeg is installed
 FFMPEG_BIN = shutil.which("ffmpeg")
@@ -45,6 +54,14 @@ class ScheduledAudio:
     file_path: str
     start_time: float
     duration_seconds: float
+    line_type: str
+    playback_speed: float = 1.0
+
+
+@dataclass(frozen=True)
+class _AudioCandidate:
+    file_path: Path
+    natural_duration_seconds: float
     line_type: str
 
 
@@ -193,39 +210,67 @@ def _is_spoken_tts_cue(line: object) -> bool:
     return len(text.split()) <= 8
 
 
-def _schedule_line(
-    scheduled: list[ScheduledAudio],
-    audio_path: Path,
-    *,
-    unit_start: float,
-    unit_end: float,
-    cursor: float,
-    line_type: str,
-    max_duration: float | None = None,
-) -> float:
+def _audio_candidate(audio_path: Path, line_type: str) -> _AudioCandidate:
     natural_duration = _get_media_duration_sync(str(audio_path))
     if natural_duration <= 0:
         natural_duration = 0.5
-    available = max(0.25, unit_end - cursor)
-    duration = min(natural_duration, available)
-    if max_duration is not None:
-        duration = min(duration, max_duration)
-    start = min(max(cursor, unit_start), max(unit_start, unit_end - duration))
-    scheduled.append(
-        ScheduledAudio(
-            file_path=str(audio_path),
-            start_time=start,
-            duration_seconds=duration,
-            line_type=line_type,
-        )
+    return _AudioCandidate(
+        file_path=audio_path,
+        natural_duration_seconds=natural_duration,
+        line_type=line_type,
     )
-    return min(unit_end, start + duration + 0.15)
+
+
+def _schedule_unit_audio(
+    candidates: list[_AudioCandidate],
+    *,
+    unit_start: float,
+    unit_duration: float,
+) -> list[ScheduledAudio]:
+    if not candidates:
+        return []
+
+    line_gap = 0.15 if len(candidates) > 1 else 0.0
+    total_gap = line_gap * max(0, len(candidates) - 1)
+    total_natural = sum(item.natural_duration_seconds for item in candidates)
+    minimum_edge_buffer = min(0.35, unit_duration * 0.08)
+    comfortable_duration = total_natural + total_gap + (minimum_edge_buffer * 2)
+
+    if comfortable_duration <= unit_duration:
+        playback_speed = 1.0
+        edge_buffer = (unit_duration - total_natural - total_gap) / 2
+    else:
+        available_for_audio = max(0.25, unit_duration - total_gap)
+        playback_speed = max(1.0, total_natural / available_for_audio)
+        edge_buffer = 0.0
+
+    scheduled: list[ScheduledAudio] = []
+    cursor = unit_start + edge_buffer
+    unit_end = unit_start + unit_duration
+
+    for candidate in candidates:
+        duration = candidate.natural_duration_seconds / playback_speed
+        duration = min(duration, max(0.05, unit_end - cursor))
+        scheduled.append(
+            ScheduledAudio(
+                file_path=str(candidate.file_path),
+                start_time=cursor,
+                duration_seconds=duration,
+                line_type=candidate.line_type,
+                playback_speed=playback_speed,
+            )
+        )
+        cursor += duration + line_gap
+
+    return scheduled
 
 
 def _collect_tts_audio_files(
     units: Sequence[Scene | Shot],
-    audio_dir: Path = Path("./output/audio"),
+    audio_dir: Path | None = None,
 ) -> list[ScheduledAudio]:
+    if audio_dir is None:
+        audio_dir = get_run_output_root() / "audio"
     audio_files: list[ScheduledAudio] = []
     unit_start = 0.0
 
@@ -249,8 +294,7 @@ def _collect_tts_audio_files(
         dialogue_lines = list(getattr(unit, "dialogue", []))
         inner_monologue = list(getattr(unit, "inner_monologue", []))
 
-        ambient_budget = unit_duration * 0.45 if dialogue_lines or inner_monologue else unit_duration * 0.75
-        ambient_cursor = unit_start
+        candidates: list[_AudioCandidate] = []
         for cue in [*narration_cues, *ambient_cues]:
             audio_path = _find_tts_audio(
                 audio_dir,
@@ -259,20 +303,8 @@ def _collect_tts_audio_files(
             )
             if not audio_path:
                 continue
-            max_duration = max(0.5, ambient_budget / max(1, len(narration_cues) + len(ambient_cues)))
-            ambient_cursor = _schedule_line(
-                audio_files,
-                audio_path,
-                unit_start=unit_start,
-                unit_end=unit_end,
-                cursor=ambient_cursor,
-                line_type=_line_type(cue, "ambient"),
-                max_duration=max_duration,
-            )
+            candidates.append(_audio_candidate(audio_path, _line_type(cue, "ambient")))
 
-        speech_cursor = unit_start
-        if narration_cues or ambient_cues:
-            speech_cursor = min(unit_end, unit_start + min(ambient_budget, unit_duration * 0.35))
         for line in [*dialogue_lines, *inner_monologue]:
             audio_path = _find_tts_audio(
                 audio_dir,
@@ -281,16 +313,31 @@ def _collect_tts_audio_files(
             )
             if not audio_path:
                 continue
-            speech_cursor = _schedule_line(
-                audio_files,
-                audio_path,
+            candidates.append(_audio_candidate(audio_path, _line_type(line, "dialogue")))
+
+        audio_files.extend(
+            _schedule_unit_audio(
+                candidates,
                 unit_start=unit_start,
-                unit_end=unit_end,
-                cursor=speech_cursor,
-                line_type=_line_type(line, "dialogue"),
+                unit_duration=unit_duration,
             )
+        )
         unit_start = unit_end
     return audio_files
+
+
+def _atempo_filter(speed: float) -> str:
+    """Build an FFmpeg atempo chain for the requested playback speed."""
+    if speed <= 1.001:
+        return ""
+
+    parts: list[str] = []
+    remaining = speed
+    while remaining > 2.0:
+        parts.append("atempo=2.000")
+        remaining /= 2.0
+    parts.append(f"atempo={remaining:.3f}")
+    return ",".join(parts) + ","
 
 
 async def compose_video(state: PipelineState) -> tuple[str, CostRecord]:
@@ -506,7 +553,7 @@ def _run_ffmpeg_compose(
             return output_path
 
         # ── Step 4: Collect TTS audio files ─────────────────────
-        audio_files = _collect_tts_audio_files(units)
+        audio_files = _collect_tts_audio_files(units, get_run_output_root() / "audio")
 
         # ── Step 5: Mix audio into final video ──────────────────
         if audio_files:
@@ -518,9 +565,10 @@ def _run_ffmpeg_compose(
                 inputs.extend(["-i", scheduled_audio.file_path])
                 delay_ms = int(scheduled_audio.start_time * 1000)
                 trim_duration = max(0.25, scheduled_audio.duration_seconds)
+                atempo = _atempo_filter(scheduled_audio.playback_speed)
                 # atrim keeps long ambience/voiceover from spilling into later shots.
                 filter_parts.append(
-                    f"[{idx + 1}:a]atrim=duration={trim_duration:.3f},"
+                    f"[{idx + 1}:a]{atempo}atrim=duration={trim_duration:.3f},"
                     f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms},"
                     "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=mono"
                     f"[a{idx}]"

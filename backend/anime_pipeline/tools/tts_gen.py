@@ -49,11 +49,20 @@ import httpx
 
 from ..cost_tracker import add_costs, calc_tts_cost, zero_cost
 from ..env import get_config
+from ..output_paths import get_run_output_root, set_run_output_root
 from ..models import CostRecord
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = Path("./output/audio")
+OUTPUT_DIR = get_run_output_root() / "audio"
+
+
+def set_output_root(output_root: str | Path) -> Path:
+    """Point TTS artifacts at a run-scoped directory."""
+    global OUTPUT_DIR
+    root = set_run_output_root(output_root)
+    OUTPUT_DIR = root / "audio"
+    return root
 
 # ── Voice mappings ───────────────────────────────────────────
 OPENAI_VOICES = {
@@ -198,7 +207,7 @@ def _build_tts_delivery_instructions(
     if line_type == "inner_monologue":
         parts.append("Perform this as intimate inner thought, close and emotionally honest.")
     elif line_type == "ambient":
-        parts.append("Perform this as a short background thought-ribbon whisper, not a loud narrator.")
+        parts.append("Perform this as a short background thought fragment whisper, not a loud narrator.")
     elif line_type == "narration":
         parts.append("Perform this as soft thematic narration, restrained and cinematic.")
     else:
@@ -209,7 +218,7 @@ def _build_tts_delivery_instructions(
         parts.append("Add controlled anxiety and a slight breath catch without becoming melodramatic.")
     if any(term in lower for term in ("tired", "exhausted", "pretending", "fine")):
         parts.append("Use a quieter, more fragile delivery with restrained emotion.")
-    if any(term in lower for term in ("whisper", "thought-ribbon", "ambient")):
+    if any(term in lower for term in ("whisper", "thought fragment", "ambient")):
         parts.append("Keep it whispered and airy.")
     if delivery_instructions:
         parts.append(delivery_instructions.strip())

@@ -2,14 +2,14 @@
 # Shot CLI — single-shot generator and tester
 #
 # Lightweight command-line tool to generate a single `Shot` using the
-# project's image/video/hybrid generation backends. Intended for local
+# project's image/hybrid generation backends. Intended for local
 # testing, debugging, and spot-generation of individual shots outside the
 # full pipeline orchestration.
 #
 # Responsibilities:
 #   - Build or load a `Shot` model (example or from JSON).
 #   - Select and run the appropriate generator based on
-#     `Shot.estimated_generation_mode` (image, video, hybrid).
+#     `Shot.estimated_generation_mode` (image, hybrid).
 #   - Return generation artifacts (paths, keyframes) and cost metadata
 #     in a small JSON payload suitable for integration tests.
 #
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -46,10 +47,11 @@ from .models import (  # noqa: E402
     Shot,
     ShotCharacterDirection,
 )
+from .pipeline_orchestrator import set_run_output_root  # noqa: E402
 from .tools.image_gen import (  # noqa: E402
     generate_scene_image,
-    generate_scene_video,
     generate_shot_hybrid,
+    set_debug_prompts,
 )
 
 
@@ -142,6 +144,9 @@ async def _run(args: argparse.Namespace) -> None:
         return
 
     console.print(Panel("[bold magenta]🎞 Shot Hybrid Generator[/bold magenta]", expand=False))
+    set_debug_prompts(args.debug_prompts)
+    run_root = Path(args.output_root).expanduser() if args.output_root else Path("./output/runs") / uuid.uuid4().hex[:8]
+    set_run_output_root(run_root)
     if args.show_capabilities:
         print_capabilities_report()
 
@@ -170,30 +175,6 @@ async def _run(args: argparse.Namespace) -> None:
             "keyframe_paths": keyframe_paths,
             "hybrid_metadata": hybrid_metadata,
         }
-    elif shot.estimated_generation_mode == "video":
-        scene_like = {
-            "id": shot.id,
-            "index": shot.index,
-            "type": "key",
-            "title": shot.visual_intent[:40] or f"Shot {shot.index + 1}",
-            "description": shot.action_description,
-            "location": shot.location,
-            "time_of_day": shot.time_of_day,
-            "mood": shot.mood,
-            "duration_seconds": shot.duration_seconds,
-            "generation_prompt": shot.generation_prompt,
-            "negative_prompt": shot.negative_prompt,
-            "needs_video": True,
-        }
-        from .models import Scene
-
-        video_path, cost = await generate_scene_video(
-            Scene.model_validate(scene_like),
-            quality_preset=args.quality_preset,
-            video_provider=args.video_provider,
-            budget_mode=args.budget_mode,
-        )
-        result = {"mode": "video", "video_path": video_path, "cost_usd": cost.total_cost_usd}
     else:
         from .models import Scene
 
@@ -235,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json", help="Optional path to write the result metadata JSON.")
     parser.add_argument("--quality-preset", choices=["draft", "standard", "high"], default="draft")
     parser.add_argument("--budget-mode", choices=["budget", "balanced", "quality"], default="budget")
+    parser.add_argument(
+        "--output-root",
+        help="Base directory for this run's artifacts. A run_id subfolder is created under it.",
+    )
+    parser.add_argument(
+        "--debug-prompts",
+        action="store_true",
+        help="Print full provider prompts before they are sent.",
+    )
     parser.add_argument(
         "--video-provider",
         choices=["auto", "seedance", "kling", "runway"],

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import re
 from pathlib import Path
@@ -30,7 +31,13 @@ import anime_pipeline.pipeline_orchestrator as orchestrator
 import anime_pipeline.sequence_cli as sequence_cli
 import anime_pipeline.tools.ffmpeg_compose as ffmpeg_compose
 import anime_pipeline.tools.image_gen as image_gen
-from anime_pipeline.agent_definitions import AgentDefinition
+import anime_pipeline.tools.tts_gen as tts_gen
+from anime_pipeline.agent_definitions import (
+    SCENE_BREAKDOWN_AGENT,
+    SHOT_PLANNING_AGENT,
+    STORY_GENERATION_AGENT,
+    AgentDefinition,
+)
 from anime_pipeline.agent_runner import LLMRouter, run_agent
 from anime_pipeline.checkpoint_system import CheckpointResolver, process_checkpoint
 from anime_pipeline.cost_tracker import (
@@ -104,6 +111,7 @@ from anime_pipeline.pipeline_orchestrator import (
     run_from_state,
 )
 from anime_pipeline.pipeline_state import (
+    allocate_shot_generation_budget,
     create_initial_state,
     record_stage_complete,
     set_story,
@@ -114,6 +122,8 @@ from anime_pipeline.tools.image_gen import (
     _reference_pack_specs,
     _select_reference_image_for_shot,
     _starter_reference_pack_specs,
+    _log_provider_prompt_debug,
+    set_debug_prompts,
 )
 from anime_pipeline.tools.tts_gen import (
     OPENAI_VOICES,
@@ -126,6 +136,7 @@ from anime_pipeline.tools.tts_gen import (
     _speed_from_hint,
 )
 from anime_pipeline.voice_profiles import infer_voice_profile
+from anime_pipeline.output_paths import get_run_output_root
 
 
 def _make_state() -> PipelineState:
@@ -606,6 +617,18 @@ def test_voice_profile_inference_from_character_description() -> None:
     assert "warm" in profile
 
 
+def test_voice_profile_treats_school_aged_as_young() -> None:
+    profile = infer_voice_profile(
+        [
+            "Hana",
+            "High-school-aged girl with short brown hair",
+            "bright amber eyes",
+        ]
+    )
+
+    assert profile.startswith("female_young;")
+
+
 def test_voice_profile_uses_character_identity_before_relationship_terms() -> None:
     profile = infer_voice_profile(
         [
@@ -621,6 +644,77 @@ def test_voice_profile_uses_character_identity_before_relationship_terms() -> No
     assert profile.startswith("male_old;")
     assert teenage_profile.startswith("female_young;")
     assert OPENAI_VOICES["default"] == "alloy"
+
+
+def test_debug_prompt_logging_is_opt_in(caplog: pytest.LogCaptureFixture) -> None:
+    set_debug_prompts(False)
+    with caplog.at_level(logging.INFO, logger="anime_pipeline.tools.image_gen"):
+        _log_provider_prompt_debug("openai image", "full prompt text")
+    assert "full prompt text" not in caplog.text
+
+    caplog.clear()
+    set_debug_prompts(True)
+    with caplog.at_level(logging.INFO, logger="anime_pipeline.tools.image_gen"):
+        _log_provider_prompt_debug("openai image", "full prompt text")
+    assert "openai image prompt:" in caplog.text
+    assert "full prompt text" in caplog.text
+    set_debug_prompts(False)
+
+
+def test_run_output_root_updates_shared_artifact_dirs(tmp_path: Path) -> None:
+    previous_root = get_run_output_root()
+    try:
+        orchestrator.set_run_output_root(tmp_path / "run-1234")
+        assert get_run_output_root() == tmp_path / "run-1234"
+        assert image_gen.OUTPUT_DIR == tmp_path / "run-1234" / "images"
+        assert image_gen.VIDEO_OUTPUT_DIR == tmp_path / "run-1234" / "videos"
+        assert tts_gen.OUTPUT_DIR == tmp_path / "run-1234" / "audio"
+        assert ffmpeg_compose.OUTPUT_DIR == tmp_path / "run-1234"
+    finally:
+        orchestrator.set_run_output_root(previous_root)
+
+
+def test_tts_collection_defaults_to_run_audio_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_root = get_run_output_root()
+    try:
+        orchestrator.set_run_output_root(tmp_path / "run-5678")
+        shot = Shot(
+            id="shot-1",
+            index=0,
+            duration_seconds=3.0,
+            location="Roof",
+            time_of_day="evening",
+            mood="calm",
+            visual_intent="Two students talk",
+            action_description="They exchange a short line.",
+            dialogue=[
+                DialogueLine(
+                    id="line-default-root",
+                    character_id="hana",
+                    text="Hello there.",
+                    emotion="warm",
+                )
+            ],
+        )
+        expected_audio_dir = tmp_path / "run-5678" / "audio"
+        expected_audio_dir.mkdir(parents=True, exist_ok=True)
+
+        def _fake_find(audio_dir: Path, *, line_id: str, character_id: str | None) -> Path:
+            assert audio_dir == expected_audio_dir
+            return expected_audio_dir / "line_default.mp3"
+
+        monkeypatch.setattr(ffmpeg_compose, "_find_tts_audio", _fake_find)
+        monkeypatch.setattr(ffmpeg_compose, "_get_media_duration_sync", lambda path: 1.0)
+
+        audio_files = ffmpeg_compose._collect_tts_audio_files([shot])
+
+        assert len(audio_files) == 1
+        assert audio_files[0].file_path == str(expected_audio_dir / "line_default.mp3")
+    finally:
+        orchestrator.set_run_output_root(previous_root)
 
 
 def test_tts_collection_repairs_legacy_dialogue_and_assigns_scene_pov_voice() -> None:
@@ -1317,12 +1411,14 @@ def test_tts_audio_lines_in_same_unit_are_scheduled_sequentially(
     audio_files = ffmpeg_compose._collect_tts_audio_files([shot], tmp_path)
 
     assert [(item.file_path, item.start_time) for item in audio_files] == [
-        (str(first_audio), 0.0),
-        (str(second_audio), 1.15),
+        (str(first_audio), pytest.approx(0.925)),
+        (str(second_audio), pytest.approx(2.075)),
     ]
+    assert all(item.duration_seconds == pytest.approx(1.0) for item in audio_files)
+    assert all(item.playback_speed == pytest.approx(1.0) for item in audio_files)
 
 
-def test_tts_audio_scheduler_trims_ambient_before_dialogue(
+def test_tts_audio_scheduler_speeds_overfull_shot_without_dropping_lines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1337,7 +1433,7 @@ def test_tts_audio_scheduler_trims_ambient_before_dialogue(
         location="Hallway",
         time_of_day="afternoon",
         mood="overwhelmed",
-        visual_intent="Thought ribbons crowd Hana",
+        visual_intent="Glowing strands crowd Hana",
         action_description="Hana hears whispers",
         audio_cues=[
             AudioCue(
@@ -1371,10 +1467,19 @@ def test_tts_audio_scheduler_trims_ambient_before_dialogue(
     assert len(audio_files) == 2
     assert audio_files[0].line_type == "ambient"
     assert audio_files[0].start_time == 0.0
-    assert audio_files[0].duration_seconds == pytest.approx(1.8)
+    assert audio_files[0].duration_seconds == pytest.approx(3.5, abs=0.01)
+    assert audio_files[0].playback_speed == pytest.approx(2.857, abs=0.01)
     assert audio_files[1].line_type == "dialogue"
-    assert audio_files[1].start_time == pytest.approx(1.4)
+    assert audio_files[1].start_time == pytest.approx(3.65, abs=0.01)
+    assert audio_files[1].duration_seconds == pytest.approx(0.35, abs=0.01)
+    assert audio_files[1].playback_speed == pytest.approx(2.857, abs=0.01)
     assert audio_files[1].start_time + audio_files[1].duration_seconds <= 4.0
+
+
+def test_atempo_filter_chains_large_speed_factors() -> None:
+    assert ffmpeg_compose._atempo_filter(1.0) == ""
+    assert ffmpeg_compose._atempo_filter(1.25) == "atempo=1.250,"
+    assert ffmpeg_compose._atempo_filter(5.0) == "atempo=2.000,atempo=2.000,atempo=1.250,"
 
 
 def test_shot_output_updates_timeline_visual_path() -> None:
@@ -1979,7 +2084,7 @@ def test_normalize_shot_maps_narrator_audio_cue_to_narration() -> None:
         index=0,
         type="normal",
         title="Hallway noise",
-        description="Thought ribbons crowd the hallway.",
+        description="Glowing strands crowd the hallway.",
         location="school hallway",
         time_of_day="afternoon",
         mood="overwhelming",
@@ -1994,7 +2099,7 @@ def test_normalize_shot_maps_narrator_audio_cue_to_narration() -> None:
             "location": "School hallway",
             "time_of_day": "afternoon",
             "mood": "overwhelming",
-            "visual_intent": "Reveal glowing thought-ribbons.",
+            "visual_intent": "Reveal glowing thought fragments.",
             "action_description": "Hana enters the hallway.",
             "audio_cues": [
                 {
@@ -2104,6 +2209,70 @@ def test_normalize_shot_builds_character_state_from_flat_character_dict() -> Non
     assert normalized["characters"][0]["state"]["expression"] == "nervous"
 
 
+def test_normalize_shot_accepts_string_character_state() -> None:
+    scene = Scene(
+        id="scene-1",
+        index=0,
+        type="normal",
+        title="Roof scene",
+        description="Hana hesitates before speaking.",
+        location="school rooftop",
+        time_of_day="sunset",
+        mood="fragile",
+        duration_seconds=8.0,
+    )
+    normalized = _normalize_shot(
+        {
+            "id": "shot-1",
+            "scene_id": "scene-1",
+            "index": 0,
+            "characters": [
+                {
+                    "character_id": "hana-id",
+                    "name": "Hana",
+                    "state": "holding a bundle of decorations, looking toward the lantern line",
+                }
+            ],
+            "description": "Hana looks toward the rooftop lanterns.",
+        },
+        {"scene-1": scene},
+        {"hana": "hana-id"},
+    )
+
+    assert normalized["characters"][0]["character_id"] == "hana-id"
+    assert normalized["characters"][0]["state"]["character_id"] == "hana-id"
+    assert (
+        normalized["characters"][0]["state"]["action"]
+        == "holding a bundle of decorations, looking toward the lantern line"
+    )
+
+
+def test_story_generation_prompt_stays_coarse_and_does_not_require_scene_type() -> None:
+    prompt = STORY_GENERATION_AGENT.system_prompt
+
+    assert "coarse narrative scenes" in prompt
+    assert "type: \"key\"" not in prompt
+    assert "priority_score" not in prompt
+    assert "is_action_heavy" not in prompt
+
+
+def test_scene_breakdown_prompt_claims_production_scene_responsibility() -> None:
+    prompt = SCENE_BREAKDOWN_AGENT.system_prompt
+
+    assert "production-ready scenes" in prompt
+    assert "Assign character IDs" in prompt or "assign character IDs" in prompt
+    assert "is_action_heavy" in prompt
+    assert "priority_score" in prompt
+
+
+def test_shot_planning_prompt_preserves_emotional_dialogue_intent() -> None:
+    prompt = SHOT_PLANNING_AGENT.system_prompt
+
+    assert "Use inner_monologue when emotional subtext matters" in prompt
+    assert "Preserve story and scene-level dialogue/inner_monologue intent" in prompt
+    assert "Spoken dialogue is optional" in prompt
+
+
 def test_shot_cli_example_is_hybrid_ready() -> None:
     shot = build_example_shot()
 
@@ -2199,6 +2368,173 @@ def test_pipeline_estimate_respects_budget_mode_for_provider_selection() -> None
     assert budget.image_cost_usd < balanced.image_cost_usd
     assert budget.tts_cost_usd < balanced.tts_cost_usd
     assert budget.total_cost_usd < balanced.total_cost_usd
+
+
+def test_shot_budget_allocation_prefers_high_utility_shots() -> None:
+    scene_video = Scene(
+        id="scene-video",
+        index=0,
+        type="key",
+        title="Action beat",
+        description="A fast confrontation on the rooftop.",
+        location="Rooftop",
+        time_of_day="sunset",
+        mood="tense",
+        duration_seconds=4.0,
+        is_action_heavy=True,
+        priority_score=1.0,
+    )
+    scene_hybrid = Scene(
+        id="scene-hybrid",
+        index=1,
+        type="key",
+        title="Confession beat",
+        description="A close emotional exchange.",
+        location="Rooftop",
+        time_of_day="sunset",
+        mood="fragile",
+        duration_seconds=10.0,
+        is_action_heavy=False,
+        priority_score=1.0,
+    )
+    scene_image = Scene(
+        id="scene-image",
+        index=2,
+        type="normal",
+        title="Transition beat",
+        description="A brief visual bridge.",
+        location="Hallway",
+        time_of_day="afternoon",
+        mood="neutral",
+        duration_seconds=2.0,
+        is_action_heavy=False,
+        priority_score=0.1,
+    )
+    shot_video = Shot(
+        id="shot-video",
+        index=0,
+        scene_id="scene-video",
+        purpose="action",
+        duration_seconds=4.0,
+        shot_scale="wide",
+        camera_angle="eye_level",
+        camera_motion="tracking",
+        location="Rooftop",
+        time_of_day="sunset",
+        mood="tense",
+        visual_intent="The fight surges forward.",
+        action_description="Hana dashes toward the doorway.",
+    )
+    shot_hybrid = Shot(
+        id="shot-hybrid",
+        index=1,
+        scene_id="scene-hybrid",
+        purpose="dialogue",
+        duration_seconds=10.0,
+        shot_scale="close_up",
+        camera_angle="eye_level",
+        camera_motion="static",
+        location="Rooftop",
+        time_of_day="sunset",
+        mood="fragile",
+        visual_intent="A trembling confession close-up.",
+        action_description="Hana finally looks up.",
+        dialogue=[DialogueLine(character_id="hana", text="I'm tired of pretending.", emotion="soft")],
+        inner_monologue=[
+            AudioCue(
+                type="inner_monologue",
+                character_id="hana",
+                text="I can't keep hiding this.",
+                emotion="soft",
+            )
+        ],
+        continuity_mode="reference",
+        estimated_generation_mode="hybrid",
+        keyframes=KeyframePlan(
+            opening_frame_prompt="Hana looking down with a tense smile",
+            ending_frame_prompt="Hana looking up with resolve",
+        ),
+    )
+    shot_image = Shot(
+        id="shot-image",
+        index=2,
+        scene_id="scene-image",
+        purpose="transition",
+        duration_seconds=2.0,
+        shot_scale="wide",
+        camera_angle="eye_level",
+        camera_motion="static",
+        location="Hallway",
+        time_of_day="afternoon",
+        mood="neutral",
+        visual_intent="A quiet hallway bridge shot.",
+        action_description="Students drift past in the background.",
+    )
+
+    state = _make_state().model_copy(
+        update={
+            "budget": BudgetConfig(hard_limit_usd=0.77, warn_at_usd=0.6),
+            "story": Story(
+                title="Budget test",
+                synopsis="A quick test story.",
+                genre=["anime"],
+                total_duration_seconds=16.0,
+                scenes=[scene_video, scene_hybrid, scene_image],
+            ),
+            "shot_plan": ShotPlan(
+                story_id="story-1",
+                shots=[shot_video, shot_hybrid, shot_image],
+                total_duration_seconds=16.0,
+            ),
+        }
+    )
+
+    updated_state, summary = allocate_shot_generation_budget(
+        state,
+        quality_preset="standard",
+        budget_mode="balanced",
+        video_provider="seedance",
+    )
+
+    assert summary.hybrid_shots == 2
+    assert summary.image_shots == 1
+    assert updated_state.shot_plan is not None
+    assert [
+        shot.estimated_generation_mode for shot in updated_state.shot_plan.shots
+    ] == ["hybrid", "hybrid", "image"]
+    assert updated_state.story is not None
+    assert updated_state.story.scenes[0].needs_video is True
+    assert updated_state.story.scenes[1].needs_video is True
+    assert updated_state.story.scenes[2].needs_video is False
+
+
+def test_generation_mode_routing_does_not_force_hybrid_from_scene_hint() -> None:
+    scene = Scene(
+        index=0,
+        type="key",
+        title="Hinted scene",
+        description="A static line of dialogue.",
+        location="Classroom",
+        time_of_day="morning",
+        mood="quiet",
+        duration_seconds=3.0,
+        needs_video=True,
+    )
+
+    mode = _decide_generation_mode(
+        {
+            "purpose": "dialogue",
+            "duration_seconds": 3.0,
+            "shot_scale": "medium",
+            "camera_motion": "static",
+            "dialogue": [{"text": "Hello"}],
+            "inner_monologue": [],
+            "keyframes": {},
+        },
+        scene,
+    )
+
+    assert mode == "image"
 
 
 @pytest.mark.asyncio
@@ -2354,7 +2690,7 @@ def test_sequence_scene_round_trip_and_parser(tmp_path: Path) -> None:
     assert args.scene_file == str(scene_path)
 
 
-def test_sequence_merges_adjacent_short_video_shots() -> None:
+def test_sequence_merges_adjacent_short_hybrid_shots() -> None:
     first = build_example_shot().model_copy(
         update={
             "id": "short-1",
@@ -2524,7 +2860,7 @@ def test_image_provider_policy_budget_overrides_high_quality() -> None:
 def test_visual_prompt_sanitizer_removes_tts_and_sensitive_visual_terms() -> None:
     raw_prompt = (
         "Hana: 16-year-old girl with chestnut hair. Her speaking voice should feel "
-        "like a teenage girl trying to sound composed. Deep red ribbons erupt from "
+        "like a teenage girl trying to sound composed. Deep red strands erupt from "
         "her chest and throat, violent glow, exposed feelings."
     )
 
@@ -2546,7 +2882,7 @@ def test_provider_prompt_compaction_keeps_kling_under_limit() -> None:
     raw_prompt = (
         "School rooftop exterior. "
         "Hana: 16-year-old girl. Her speaking voice should feel emotional. "
-        "Deep red ribbons erupting from her chest and shoulders. "
+        "Deep red strands erupting from her chest and shoulders. "
         + "Preserve these character anchors exactly: " + ("anchor details. " * 180)
     )
 
@@ -2561,7 +2897,7 @@ def test_provider_prompt_compaction_keeps_kling_under_limit() -> None:
 
 def test_prompt_lint_flags_risky_visual_combinations() -> None:
     raw_prompt = (
-        "School rooftop, evening. High-school-aged girl with ribbons erupting from "
+        "School rooftop, evening. High-school-aged girl with strands erupting from "
         "her chest and throat. Her speaking voice should feel soft and fragile. "
         "Character continuity anchors: expression panicked, exposed, overwhelmed."
     )
@@ -2983,14 +3319,14 @@ def test_final_audio_mix_does_not_shortest_trim_video() -> None:
     assert '"-shortest"' not in source
 
 
-def test_tts_collection_excludes_ambient_thought_ribbon_cues() -> None:
+def test_tts_collection_excludes_ambient_thought_fragment_cues() -> None:
     state = _make_state()
     scene = Scene(
         id="scene-thoughts",
         index=0,
         type="normal",
         title="Hallway noise",
-        description="Thought ribbons crowd Hana in the hallway.",
+        description="Glowing strands crowd Hana in the hallway.",
         location="school hallway",
         time_of_day="afternoon",
         duration_seconds=6.0,
@@ -3006,7 +3342,7 @@ def test_tts_collection_excludes_ambient_thought_ribbon_cues() -> None:
         location="school hallway",
         time_of_day="afternoon",
         mood="overwhelmed",
-        visual_intent="Neon thought-ribbons fill the hallway",
+        visual_intent="Neon thought fragments fill the hallway",
         action_description="Hana covers her ears as whispers overlap",
         audio_cues=[
             AudioCue(

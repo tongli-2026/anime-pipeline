@@ -216,7 +216,7 @@ class StyleBible(BaseModel):
 # --------------------------------------------------------------
 
 SceneType = Literal["key", "normal"]
-# key   → video generation (expensive)
+# key   → hybrid generation (expensive)
 # normal → image + transition (cheap)
 
 
@@ -245,8 +245,6 @@ class KeyframePlan(BaseModel):
 
     opening_frame_prompt: str | None = None
     opening_frame_reference: str | None = None
-    middle_frame_prompt: str | None = None
-    middle_frame_reference: str | None = None
     ending_frame_prompt: str | None = None
     ending_frame_reference: str | None = None
 
@@ -289,7 +287,7 @@ class Shot(BaseModel):
     ending_frame_path: str | None = None
     generation_prompt: str | None = None
     negative_prompt: str | None = None
-    estimated_generation_mode: Literal["image", "video", "hybrid"] = "image"
+    estimated_generation_mode: Literal["image", "hybrid"] = "image"
     output: SceneOutput | None = None
 
 
@@ -365,7 +363,7 @@ class Scene(BaseModel):
     output: SceneOutput | None = None
     is_action_heavy: bool = False          # Agent judgment: contains significant action?
     priority_score: float = 0.5            # Narrative importance (0.0-1.0): higher = more critical
-    needs_video: bool = False              # Final decision: generate video vs static image?
+    needs_video: bool = False              # Final decision: generate a motion-capable hybrid clip vs static image?
 
 
 # --------------------------------------------------------------

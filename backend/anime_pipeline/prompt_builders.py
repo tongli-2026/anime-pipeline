@@ -202,6 +202,7 @@ def _build_shot_planning_prompt(state: PipelineState) -> str:
             scene_data,
             "",
             "Expand these scenes into a shot plan with varied pacing and keyframes.",
+            "Treat estimated_generation_mode as a local creative guess; the orchestrator will later re-rank shots by utility and budget, so favor the most production-worthy shot splits rather than trying to solve the final video/image allocation here.",
         ]
     )
 
@@ -328,7 +329,6 @@ def _serialize_scene_prompt_builder_shot(shot: Shot) -> dict[str, Any]:
         "estimated_generation_mode": shot.estimated_generation_mode,
         "keyframes": {
             "opening_frame_prompt": shot.keyframes.opening_frame_prompt,
-            "middle_frame_prompt": shot.keyframes.middle_frame_prompt,
             "ending_frame_prompt": shot.keyframes.ending_frame_prompt,
         },
         "characters": [
