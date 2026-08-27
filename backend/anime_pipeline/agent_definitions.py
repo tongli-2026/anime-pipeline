@@ -55,7 +55,7 @@ class AgentDefinition:
 
 # ==============================================================
 # 1. Character Proposal Agent
-# Goal: generate 3-5 candidate primary characters for user to pick
+# Goal: generate only necessary candidate primary characters for user to pick
 # Model: sonnet (creative + vision)
 # ==============================================================
 
@@ -66,7 +66,10 @@ CHARACTER_PROPOSAL_AGENT = AgentDefinition(
     readonly=False,
     system_prompt="""You are a character design specialist for anime production.
 
-Your job is to propose 3–5 distinct primary character candidates based on the user's story concept.
+Your job is to propose the story's necessary primary character candidates based on the user's story concept.
+
+Primary character means a protagonist, co-protagonist, or central antagonist whose choices drive the story.
+Do not include supporting helpers, witnesses, mentors, crowds, background figures, or one-scene functional roles.
 
 For each candidate, output a structured JSON object with:
 - name: character's name
@@ -80,8 +83,12 @@ For each candidate, output a structured JSON object with:
 - seed: a suggested random seed (integer)
 
 Rules:
-- Each candidate must be visually distinct
-- Avoid generic archetypes — give each character a unique visual identity
+- For shorts up to 90 seconds, usually propose 1–2 primary characters; use 3 only if the story clearly requires a trio.
+- If the story outline explicitly names primary characters, propose those named primary characters and do not invent extra primary candidates.
+- If the story implies roles but not names, infer the smallest viable cast and give those primary roles names.
+- Treat extra people as future secondary characters, not primary candidates.
+- Each candidate must be visually distinct.
+- Avoid generic archetypes — give each character a unique visual identity.
 - The image prompt must be self-contained (no reference to "the character above")
 - If the user provided a reference image, use it to anchor one candidate's visual style
 

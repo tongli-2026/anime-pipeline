@@ -616,7 +616,7 @@ class UserInput(BaseModel):
             ]
             return self
 
-        raise ValueError("At least one primary character must be provided")
+        return self
 
 
 # --------------------------------------------------------------

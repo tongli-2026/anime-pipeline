@@ -33,13 +33,20 @@ import anime_pipeline.tools.ffmpeg_compose as ffmpeg_compose
 import anime_pipeline.tools.image_gen as image_gen
 import anime_pipeline.tools.tts_gen as tts_gen
 from anime_pipeline.agent_definitions import (
+    CHARACTER_PROPOSAL_AGENT,
     SCENE_BREAKDOWN_AGENT,
     SHOT_PLANNING_AGENT,
     STORY_GENERATION_AGENT,
     AgentDefinition,
 )
 from anime_pipeline.agent_runner import LLMRouter, run_agent
-from anime_pipeline.checkpoint_system import CheckpointResolver, process_checkpoint
+from anime_pipeline.checkpoint_system import (
+    AutoResolver,
+    CheckpointResolver,
+    CLIResolver,
+    _uses_timeout_fallback,
+    process_checkpoint,
+)
 from anime_pipeline.cost_tracker import (
     calc_image_cost,
     calc_llm_cost,
@@ -72,6 +79,7 @@ from anime_pipeline.models import (
     PrimaryCharacterHint,
     PrimaryCharacterInput,
     Scene,
+    SceneReviewPayload,
     SceneReviewResolution,
     SecondaryCharacter,
     SecondaryCharReviewResolution,
@@ -117,6 +125,7 @@ from anime_pipeline.pipeline_state import (
     record_stage_complete,
     set_story,
 )
+from anime_pipeline.prompt_builders import _build_character_proposal_prompt
 from anime_pipeline.quality import get_quality_profile
 from anime_pipeline.shot_cli import build_example_shot, build_parser, load_shot_from_file
 from anime_pipeline.tools.image_gen import (
@@ -281,7 +290,7 @@ def test_record_stage_complete_does_not_double_count_total_cost() -> None:
     assert len(updated.stage_history) == 1
 
 
-def test_user_input_requires_story_outline_and_primary_characters() -> None:
+def test_user_input_accepts_explicit_primary_characters() -> None:
     # Basic validation of UserInput construction and backward-compat behavior
     user_input = UserInput(
         concept="A rooftop confession story.",
@@ -297,6 +306,15 @@ def test_user_input_requires_story_outline_and_primary_characters() -> None:
 
     assert user_input.story_outline.startswith("Hana slowly opens up")
     assert len(user_input.primary_characters) == 1
+
+
+def test_user_input_allows_agent_proposed_primary_characters() -> None:
+    user_input = UserInput(
+        concept="A rooftop guardian chases a masked saboteur.",
+        story_outline="Astra and Riven clash above a neon city before realizing the real threat.",
+    )
+
+    assert user_input.primary_characters == []
 
 
 def test_user_input_backfills_primary_characters_from_legacy_hints() -> None:
@@ -459,6 +477,30 @@ async def test_optional_checkpoint_falls_back_after_timeout() -> None:
     assert cp.resolution is not None
     assert cp.resolution.type == "budget_warning"
     assert cp.resolution.action == "continue"
+
+
+def test_cli_optional_checkpoint_does_not_use_timeout_fallback() -> None:
+    checkpoint = Checkpoint(
+        type="scene_review",
+        stage="scene_review",
+        required=False,
+        timeout_ms=30_000,
+        payload=SceneReviewPayload(scenes=[]),
+    )
+
+    assert not _uses_timeout_fallback(checkpoint, CLIResolver())
+
+
+def test_auto_optional_checkpoint_does_not_use_timeout_fallback() -> None:
+    checkpoint = Checkpoint(
+        type="scene_review",
+        stage="scene_review",
+        required=False,
+        timeout_ms=30_000,
+        payload=SceneReviewPayload(scenes=[]),
+    )
+
+    assert not _uses_timeout_fallback(checkpoint, AutoResolver())
 
 
 def test_scene_review_modifications_are_applied() -> None:
@@ -2254,6 +2296,33 @@ def test_story_generation_prompt_stays_coarse_and_does_not_require_scene_type() 
     assert "type: \"key\"" not in prompt
     assert "priority_score" not in prompt
     assert "is_action_heavy" not in prompt
+
+
+def test_character_proposal_prompt_uses_minimal_primary_cast_for_short_films() -> None:
+    user_input = UserInput(
+        concept="A rooftop guardian chases a masked saboteur.",
+        story_outline=(
+            "Astra chases Riven across a floating clocktower before learning "
+            "he is trying to disable an ancient weapon."
+        ),
+        target_duration_seconds=50,
+    )
+
+    prompt = _build_character_proposal_prompt(user_input)
+
+    assert "Generate 4" not in prompt
+    assert "usually 1-2 candidates" in prompt
+    assert "propose those named characters" in prompt
+    assert "additional figures" in prompt
+
+
+def test_character_proposal_agent_discourages_extra_primary_candidates() -> None:
+    prompt = CHARACTER_PROPOSAL_AGENT.system_prompt
+
+    assert "Do not include supporting helpers" in prompt
+    assert "For shorts up to 90 seconds" in prompt
+    assert "do not invent extra primary candidates" in prompt
+    assert "future secondary characters" in prompt
 
 
 def test_scene_breakdown_prompt_claims_production_scene_responsibility() -> None:

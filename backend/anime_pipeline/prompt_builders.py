@@ -69,7 +69,20 @@ def _build_character_proposal_prompt(user_input: UserInput) -> str:
                 parts.append(f"    Relationships: {character.relationship_to_others}")
             if character.reference_image:
                 parts.append("    Reference image provided: yes")
-    parts.append("\nGenerate 4 diverse primary character candidates.")
+    if user_input.target_duration_seconds <= 90:
+        parts.append(
+            "\nGenerate the smallest useful primary cast, usually 1-2 candidates. "
+            "Use 3 only if the story clearly needs a trio."
+        )
+    else:
+        parts.append(
+            "\nGenerate the smallest useful primary cast, usually 2-3 candidates. "
+            "Do not add extra primary characters only for variety."
+        )
+    parts.append(
+        "If the outline already names the central characters, propose those named "
+        "characters and keep any additional figures for later secondary-character generation."
+    )
     return "\n".join(parts)
 
 

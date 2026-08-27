@@ -6,8 +6,8 @@
 #   human decisions or automated fallbacks are required before continuing.
 #
 # Responsibilities:
-#   - Present structured choices to the user (CLI / Web / API) or auto-resolve
-#     them after a configurable timeout for non-critical checkpoints.
+#   - Present structured choices to the user in interactive CLI runs, with full
+#     checkpoint context shown before each decision.
 #   - Expose a minimal abstract `CheckpointResolver` interface so production
 #     integrations (CLI, WebSocket, REST) and test mocks can be swapped in.
 #   - Return typed resolution objects used by the orchestrator to advance or
@@ -16,14 +16,16 @@
 #
 # Key behaviors:
 #   - `CLIResolver` implements interactive terminal prompts (uses `questionary`).
-#   - Optional checkpoints are auto-resolved using `asyncio.wait_for` and
-#     sensible defaults when the user does not respond in time.
+#   - `AutoResolver` resolves all checkpoints immediately for `--auto` runs.
+#   - Non-CLI resolvers can still use timeout fallback for optional checkpoints.
+#   - CLI optional checkpoints wait for explicit user input to avoid stale
+#     background terminal prompts.
 #   - All UI output uses `rich` for readable panels and highlighting.
 #
 # Notes:
 #   - Designed for testability: provide `MockResolver` implementations in tests.
-#   - Timeouts and auto-approve policies are intentionally conservative to
-#     avoid blocking long-running CI or unattended runs.
+#   - Timeout fallback is reserved for non-interactive resolver integrations,
+#     not for local terminal prompts.
 # ===================================================================================
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 from .models import (
     BudgetWarningResolution,
@@ -53,6 +56,10 @@ if TYPE_CHECKING:
     pass
 
 console = Console()
+
+
+def _print_indented_text(value: str, *, style: str = "dim") -> None:
+    console.print(Text(f"    {value}", style=style), soft_wrap=True)
 
 
 # --------------------------------------------------------------
@@ -117,17 +124,17 @@ class CLIResolver(CheckpointResolver):
         ))
 
         for c in candidates:
-            preview = c.preview_image[:60] if c.preview_image else "(none)"
             console.print(
-                f"  [yellow][{c.id[:8]}][/yellow] [bold]{c.name}[/bold]\n"
-                f"    Preview: [dim]{preview}[/dim]\n"
-                f"    Prompt: [dim]{c.prompt_base[:80]}...[/dim]\n"
+                f"  [yellow][{c.id}][/yellow] [bold]{c.name}[/bold]\n"
                 f"    Cost: [green]${c.generation_cost.total_cost_usd:.4f}[/green]\n"
             )
+            _print_indented_text(f"Preview: {c.preview_image or '(none)'}")
+            _print_indented_text(f"Prompt: {c.prompt_base}")
+            console.print()
 
         choices = [
             questionary.Choice(
-                title=f"{c.name} — {c.prompt_base[:60]}...",
+                title=f"{c.name} ({c.id})",
                 value=c.id,
                 checked=True,
             )
@@ -159,9 +166,15 @@ class CLIResolver(CheckpointResolver):
             expand=False,
         ))
 
+        for c in characters:
+            console.print(f"  [yellow][{c.id}][/yellow] [bold]{c.name}[/bold]")
+            _print_indented_text(f"Prompt: {c.prompt_base}")
+            _print_indented_text(f"Auto approved: {c.auto_approved}")
+            console.print()
+
         choices = [
             questionary.Choice(
-                title=f"{c.name} — {c.prompt_base[:60]}...",
+                title=f"{c.name} ({c.id})",
                 value=c.id,
                 checked=c.auto_approved,
             )
@@ -199,9 +212,13 @@ class CLIResolver(CheckpointResolver):
             type_label = "[red][KEY VIDEO][/red]" if scene.type == "key" else "[blue][IMAGE][/blue]"
             console.print(
                 f"  {type_label} Scene {scene.index + 1}: [bold]{scene.title}[/bold]\n"
-                f"    [dim]{scene.description[:100]}...[/dim]\n"
                 f"    Duration: {scene.duration_seconds}s | Mood: {scene.mood}\n"
             )
+            console.print(
+                Text(f"    Description: {scene.description}", style="dim"),
+                soft_wrap=True,
+            )
+            console.print()
 
         approved: bool = await asyncio.to_thread(
             questionary.confirm(
@@ -289,6 +306,19 @@ class AutoResolver(CheckpointResolver):
         return BudgetWarningResolution(action="continue")
 
 
+def _uses_timeout_fallback(
+    checkpoint: Checkpoint,
+    resolver: CheckpointResolver,
+) -> bool:
+    if checkpoint.required or checkpoint.timeout_ms is None:
+        return False
+    if isinstance(resolver, AutoResolver):
+        return False
+    # Interactive terminal prompts run in a worker thread. They cannot be
+    # cancelled safely on timeout, so avoid leaving stale prompts behind.
+    return not isinstance(resolver, CLIResolver)
+
+
 async def _resolve_with_resolver(
     checkpoint: Checkpoint,
     resolver: CheckpointResolver,
@@ -359,7 +389,7 @@ async def process_checkpoint(
     """
     resolution: CheckpointResolution
 
-    if not checkpoint.required and checkpoint.timeout_ms is not None:
+    if _uses_timeout_fallback(checkpoint, resolver):
         # Optional checkpoints allow user input until timeout, then fall back.
         timeout_secs = checkpoint.timeout_ms / 1000.0
         resolver_task = asyncio.create_task(_resolve_with_resolver(checkpoint, resolver))

@@ -20,7 +20,7 @@
 #     --quality-preset standard
 #
 #   .venv/bin/anime-pipeline \
-#     --input-file input/story_request.cinematic-action
+#     --input-file input/story_request.cinematic-action.json
 # 
 #   Resume from a saved state:
 #     .venv/bin/anime-pipeline --state-file output/state_<run_id>.json --auto
