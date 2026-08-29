@@ -2,7 +2,14 @@
 
 [![CI](https://github.com/tongli-2026/anime-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/tongli-2026/anime-pipeline/actions/workflows/ci.yml)
 
-A cost-aware, human-in-the-loop anime generation pipeline that turns a story prompt into planned scenes, merged shot units, visuals, TTS, and a composed video. The system is designed to be resumable, budget-aware, and easy to steer with quality and provider controls.
+A cost-aware, human-in-the-loop anime generation pipeline that turns a story prompt into locked characters, structured scenes, per-shot media, TTS, and a final composed video. It is built to showcase backend orchestration, immutable state handling, checkpointed approvals, budget control, and media composition in one pipeline.
+
+## What This Project Demonstrates
+
+- Multi-stage orchestration with resumable checkpoints and run-scoped artifacts
+- Budget-aware shot routing that favors video where it adds the most value
+- Prompt construction, validation, and debug tooling for structured LLM stages
+- TTS timing plus FFmpeg composition to keep audio and visuals synchronized
 
 ## Architecture Overview
 
@@ -17,11 +24,11 @@ A cost-aware, human-in-the-loop anime generation pipeline that turns a story pro
     ↓
 [Secondary Character Agent]  →  Auto-generated (optional user confirm)
     ↓
-[Scene Prompt Builder Agent]  →  Per-scene prompts with character states
+[Scene Prompt Builder Agent]  →  Per-shot prompts with character states and continuity anchors
     ↓
 [Generation Layer]
-    ├─ Key Scene  → Hybrid generation
-    └─ Normal Scene → Image + transition
+    ├─ Image shots   → Still image generation
+    └─ Hybrid shots  → Opening/ending frames + video generation
     ↓
 [TTS Audio Agent]
     ↓
@@ -46,7 +53,7 @@ anime-pipeline/
         ├── agent_definitions.py    # Agent system prompts + model tiers
         ├── agent_runner.py         # Multi-provider LLM router with retry/fallback
         ├── checkpoint_system.py    # Human-in-the-loop checkpoint resolver
-        ├── pipeline_orchestrator.py# 10-stage pipeline coordinator
+        ├── pipeline_orchestrator.py# Multi-stage pipeline coordinator
         ├── normalizers.py          # LLM output normalization + shot mode decisions
         ├── prompt_builders.py      # Prompt construction + prompt batch runner
         ├── main.py                 # CLI entry point
@@ -66,7 +73,7 @@ cd backend
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env        # add ANTHROPIC_API_KEY
+cp .env.example .env        # add ANTHROPIC_API_KEY and optional OPENAI_API_KEY
 python -m anime_pipeline.main --auto --quality-preset standard
 ```
 
@@ -76,6 +83,13 @@ the pipeline falls back to the usual project `.env` locations.
 
 Note: `OPENAI_API_KEY` (if set) is used by the pipeline for OpenAI Text-to-Speech, OpenAI image generation when the `openai` provider is selected, and GPT-based structured stages such as scene breakdown, shot planning, prompt building, and TTS script formatting.
 `--quality-preset` accepts `draft`, `standard`, or `high`, and `--budget-mode` accepts `budget`, `balanced`, or `quality`.
+
+Useful flags:
+
+- `--auto` for unattended runs
+- `--state-file output/state_<run_id>.json` to resume from a saved state
+- `--debug-prompts` to print provider prompts when debugging generation issues
+- `--quality-preset draft|standard|high` to keep images, video, and composition aligned
 
 ## Development Checks
 

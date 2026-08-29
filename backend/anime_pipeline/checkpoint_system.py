@@ -16,16 +16,17 @@
 #
 # Key behaviors:
 #   - `CLIResolver` implements interactive terminal prompts (uses `questionary`).
-#   - `AutoResolver` resolves all checkpoints immediately for `--auto` runs.
-#   - Non-CLI resolvers can still use timeout fallback for optional checkpoints.
+#   - `AutoResolver` resolves checkpoints immediately for `--auto` runs.
+#   - Optional checkpoints can use timeout fallback in non-CLI integrations that
+#     explicitly opt into it; local CLI prompts wait for explicit user input.
 #   - CLI optional checkpoints wait for explicit user input to avoid stale
 #     background terminal prompts.
 #   - All UI output uses `rich` for readable panels and highlighting.
 #
 # Notes:
 #   - Designed for testability: provide `MockResolver` implementations in tests.
-#   - Timeout fallback is reserved for non-interactive resolver integrations,
-#     not for local terminal prompts.
+#   - Timeout fallback is reserved for integrations that need unattended
+#     resolution; it is not used for local terminal prompts.
 # ===================================================================================
 
 from __future__ import annotations
@@ -263,7 +264,7 @@ class CLIResolver(CheckpointResolver):
         return BudgetWarningResolution(action=action)
 
 # --------------------------------------------------------------
-# Auto resolver — for optional checkpoints with timeout
+# Auto resolver — for unattended `--auto` runs
 # --------------------------------------------------------------
 
 class AutoResolver(CheckpointResolver):
@@ -391,7 +392,9 @@ async def process_checkpoint(
 
     if _uses_timeout_fallback(checkpoint, resolver):
         # Optional checkpoints allow user input until timeout, then fall back.
-        timeout_secs = checkpoint.timeout_ms / 1000.0
+        timeout_ms = checkpoint.timeout_ms
+        assert timeout_ms is not None
+        timeout_secs = timeout_ms / 1000.0
         resolver_task = asyncio.create_task(_resolve_with_resolver(checkpoint, resolver))
         try:
             resolution = await asyncio.wait_for(resolver_task, timeout=timeout_secs)

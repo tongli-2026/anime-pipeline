@@ -6,6 +6,8 @@
 # - `--input-file <path>`: path to a `UserInput` JSON file to drive a run.
 # - `--state-file <path>`: path to a saved `PipelineState` JSON file to resume.
 # - `--quality-preset <draft|standard|high>`: end-to-end output quality.
+# - `--output-root <path>`: write artifacts into a run-scoped subdirectory.
+# - `--debug-prompts`: print provider prompts while debugging generation issues.
 #
 # Interactive choices (when not using `--auto`):
 # - Output quality: `draft`, `standard`, `high`
@@ -18,6 +20,7 @@
 #   .venv/bin/anime-pipeline --auto \
 #     --input-file input/story_request.example.json \
 #     --quality-preset standard
+#     --debug-prompts
 #
 #   .venv/bin/anime-pipeline \
 #     --input-file input/story_request.cinematic-action.json
@@ -28,7 +31,8 @@
 # Developer module entrypoint:
 #   .venv/bin/python -m anime_pipeline.main --auto \
 #     --input-file input/story_request.example.json \
-#     --quality-preset standard
+#     --quality-preset standard \
+#     --debug-prompts
 # ===============================================================================================
 
 from __future__ import annotations
@@ -125,6 +129,8 @@ def _build_parser() -> argparse.ArgumentParser:
     - `--input-file`: path to a `UserInput` JSON file
     - `--state-file`: path to a saved `PipelineState` JSON file to resume
     - `--quality-preset <draft|standard|high>`: end-to-end output quality
+    - `--output-root`: base directory for run-scoped artifacts
+    - `--debug-prompts`: print provider prompts while debugging
     """
     parser = argparse.ArgumentParser(
         prog="anime-pipeline",

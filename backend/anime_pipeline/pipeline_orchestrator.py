@@ -1,7 +1,7 @@
 # ==============================================================
 # Pipeline Orchestrator — the central coordinator
 #
-# Runs the 10-stage pipeline sequentially:
+# Runs the multi-stage pipeline sequentially:
 #   1. Character Proposal → User selects → Lock characters
 #   2. Reference Pack Generation
 #   3. Story Generation
@@ -695,7 +695,7 @@ async def run_pipeline(
     options: PipelineOptions | None = None,
 ) -> PipelineState:
     """
-    Execute the full 10-stage anime generation pipeline.
+    Execute the full multi-stage anime generation pipeline.
 
     Stages:
       1. Character Proposal       (LLM + image gen)

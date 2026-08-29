@@ -1,6 +1,9 @@
 # anime-pipeline — Python Backend
 
-FastAPI + asyncio backend for the anime generation pipeline.  
+FastAPI + asyncio backend for the anime generation pipeline.
+The repo is intentionally organized to highlight backend orchestration:
+immutable state transitions, checkpoint-driven control flow, budget guardrails,
+provider fallback, and deterministic media composition.
 
 ## Project layout
 
@@ -15,7 +18,7 @@ backend/
     ├── agent_definitions.py    # agent system prompts + model tiers
     ├── agent_runner.py         # multi-provider LLM router with retry/fallback
     ├── checkpoint_system.py    # human-in-the-loop checkpoint resolver
-    ├── pipeline_orchestrator.py# 10-stage pipeline coordinator
+    ├── pipeline_orchestrator.py# Multi-stage pipeline coordinator
     ├── normalizers.py          # LLM output normalization + shot mode decisions
     ├── prompt_builders.py      # prompt construction + prompt batch runner
     ├── main.py                 # CLI entry point
@@ -32,7 +35,7 @@ cd backend
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env   # add your ANTHROPIC_API_KEY
+cp .env.example .env   # add ANTHROPIC_API_KEY and optional OPENAI_API_KEY
 ```
 
 If you want to load a custom env file instead of the default `.env` locations,
@@ -57,10 +60,11 @@ anime-pipeline
 
 ## Output quality
 
-The selected quality preset is shared by scene images, hybrid keyframes, video
-provider requests, and final FFmpeg composition. Scene/keyframe images are
+The selected quality preset is shared by scene images, shot keyframes, video
+provider requests, and final FFmpeg composition. Scene and keyframe images are
 normalized to the same 16:9 canvas before they are sent to image-to-video models.
-Character reference sheets keep their original portrait or full-body framing.
+Character reference sheets keep their original portrait or full-body framing so
+they remain useful for later shot continuity checks.
 
 | Preset | Canvas and video request | Final encoding |
 |--------|--------------------------|----------------|
@@ -90,7 +94,8 @@ three-quarter portrait, a front-facing full-body view, and an expression sheet.
 Existing views are reused instead of regenerated; side and back views remain
 available for later shot-driven expansion. API failures continue through the
 fallback chain when another compatible provider is available. `OPENAI_API_KEY`
-is shared with OpenAI TTS, and API usage is billed separately from a ChatGPT
+is shared with OpenAI TTS, OpenAI image generation when selected, and GPT-based
+structured stages, and API usage is billed separately from a ChatGPT
 subscription.
 
 fal.ai estimates account for whole-megapixel rounding: approximately $0.025 for
@@ -235,23 +240,23 @@ The only parallel layer is **image/video generation** (`asyncio.gather` in
 
 | Model | Used for | Reason |
 |-------|----------|--------|
-| **Claude Sonnet 4.6** | `character-proposal`, `story-generation` | Creativity, narrative quality, visual imagination |
-| **GPT-5.4 mini** | scene/shot planning, prompt building, secondary characters, TTS script | JSON Schema output, lower structured-task cost |
-| **Claude Haiku 4.5** | structured fallback | Keeps the pipeline operational when OpenAI is unavailable |
+| **Claude Sonnet** | `character-proposal`, `story-generation` | Creativity, narrative quality, visual imagination |
+| **GPT structured calls** | scene/shot planning, prompt building, secondary characters, TTS script | JSON-shaped output and lower structured-task cost |
+| **Fallback provider** | structured retries when the preferred provider is unavailable | Keeps the pipeline operational without changing orchestration code |
 
 `LLMRouter` selects the provider by agent tier. It retains dependency injection for
-mock tests and falls back from OpenAI GPT structured calls to Claude Haiku without
-changing orchestration code. Cost records use the model that actually completed each
-call.
+mock tests and keeps the orchestration code provider-agnostic. Cost records use the
+model that actually completed each call.
 
 ### Other key design decisions
 
 - **Immutable state** — every function in `pipeline_state.py` returns a new
   `PipelineState` via `model_copy(update={...})`, never mutating in place.
   Makes the execution history replayable and easy to debug.
-- **Checkpoint system** — `required=True` blocks until the user responds;
-  `required=False` + `timeout_ms` auto-resolves after the timeout so the
-  pipeline is never permanently stalled by optional reviews.
+- **Checkpoint system** — `required=True` blocks until the user responds.
+  Optional checkpoints wait for explicit CLI input during interactive runs and
+  resolve immediately in `--auto` mode, which keeps unattended runs moving
+  without leaving stale prompts behind.
 - **Hard budget cut** — `apply_cost_and_check_budget()` runs after every spend
   event. Exceeding `hard_limit_usd` raises `BudgetExceededError` immediately,
   caught at the top of `run_pipeline()`.
@@ -265,7 +270,7 @@ call.
 | Explicit state object | `query.ts` State type | `PipelineState` with immutable `model_copy` transitions |
 | Labeled stage transitions | `query.ts` transition field | `StageRecord` + pipeline loop |
 | Budget enforcement per step | `query.ts` blocking limit check | `apply_cost_and_check_budget()` |
-| Error recovery hooks | `query.ts` withheld messages | Budget warning checkpoint (optional, auto-resolves) |
+| Error recovery hooks | `query.ts` withheld messages | Budget warning checkpoint (optional) |
 | Checkpoint / stop-hook system | `query.ts` stop hooks | `checkpoint_system.py` required/optional checkpoints |
 | Agent dependency injection | `QueryDeps` pattern | `run_agent(agent, prompt, client)` |
 | Coordinator prompt style | `coordinatorMode.ts` | `pipeline_orchestrator.py` orchestration logic |
