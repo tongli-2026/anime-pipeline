@@ -47,7 +47,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-import jwt
 
 from ..cost_tracker import add_costs, calc_image_cost, calc_video_cost, zero_cost
 from ..env import get_config
@@ -405,17 +404,6 @@ def _compact_provider_prompt(prompt: str, max_chars: int = 2400) -> str:
             "modest school uniform."
         )
     return compact
-
-
-def _make_kling_jwt(access_key: str, secret_key: str) -> str:
-    """Generate a signed JWT for Kling API authentication (valid 30 min)."""
-    now = int(time.time())
-    payload = {
-        "iss": access_key,
-        "exp": now + 1800,  # 30 minutes
-        "nbf": now - 5,     # allow 5s clock skew
-    }
-    return jwt.encode(payload, secret_key, algorithm="HS256")
 
 
 def _select_reference_image_for_shot(shot: Shot, character_direction: Any) -> str | None:

@@ -1,6 +1,6 @@
 # anime-pipeline — Python Backend
 
-FastAPI + asyncio backend for the anime generation pipeline.
+Async Python CLI backend for the anime generation pipeline.
 The repo is intentionally organized to highlight backend orchestration:
 immutable state transitions, checkpoint-driven control flow, budget guardrails,
 provider fallback, and deterministic media composition.
@@ -25,7 +25,7 @@ backend/
     └── tools/
         ├── image_gen.py        # OpenAI/fal images + Seedance/Runway video
         ├── tts_gen.py          # OpenAI / ElevenLabs TTS
-        └── ffmpeg_compose.py   # ffmpeg-python video assembly
+        └── ffmpeg_compose.py   # FFmpeg CLI video assembly
 ```
 
 ## Setup

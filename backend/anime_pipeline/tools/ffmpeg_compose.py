@@ -2,7 +2,7 @@
 # Tool: FFmpeg Video Composition
 #
 # Assemble scene media (images/videos) and generated TTS into a final MP4.
-# Uses the system `ffmpeg` CLI via subprocess (not the ffmpeg-python wrapper).
+# Uses the system `ffmpeg` CLI via subprocess.
 #
 # Key behaviors:
 #   - Video scenes: re-encode and trim to the target duration/profile

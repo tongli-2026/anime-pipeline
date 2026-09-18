@@ -64,8 +64,6 @@ class EnvConfig:
 
     # ── Video Generation ─────────────────────────────────────
     seedance_api_key: str = ""
-    kling_access_key: str = ""
-    kling_secret_key: str = ""
     runway_api_key: str = ""
 
     # ── TTS ──────────────────────────────────────────────────
@@ -76,8 +74,6 @@ class EnvConfig:
     google_tts_api_key: str = ""
 
     # ── Optional ─────────────────────────────────────────────
-    comfyui_base_url: str = "http://localhost:8188"
-    redis_url: str = "redis://localhost:6379/0"
     budget_hard_limit: float = 5.0
     budget_warn_at: float = 3.5
 
@@ -89,14 +85,10 @@ def _load_config() -> EnvConfig:
         fal_key=os.environ.get("FAL_KEY", ""),
         replicate_api_token=os.environ.get("REPLICATE_API_TOKEN", ""),
         seedance_api_key=os.environ.get("SEEDANCE_API_KEY", ""),
-        kling_access_key=os.environ.get("KLING_ACCESS_KEY", ""),
-        kling_secret_key=os.environ.get("KLING_SECRET_KEY", ""),
         runway_api_key=os.environ.get("RUNWAY_API_KEY", ""),
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
         elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
         google_tts_api_key=os.environ.get("GOOGLE_TTS_API_KEY", ""),
-        comfyui_base_url=os.environ.get("COMFYUI_BASE_URL", "http://localhost:8188"),
-        redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
         budget_hard_limit=float(os.environ.get("BUDGET_HARD_LIMIT", "5.0")),
         budget_warn_at=float(os.environ.get("BUDGET_WARN_AT", "3.5")),
     )

@@ -42,7 +42,7 @@ A cost-aware, human-in-the-loop anime generation pipeline that turns a story pro
 ```
 anime-pipeline/
 ├── README.md
-└── backend/                        # Python backend (FastAPI + asyncio)
+└── backend/                        # Python CLI pipeline (asyncio)
     ├── README.md                   # ← full architecture docs live here
     ├── pyproject.toml
     ├── .env.example
@@ -60,7 +60,7 @@ anime-pipeline/
         └── tools/
             ├── image_gen.py        # OpenAI/fal images + Seedance/Runway video
             ├── tts_gen.py          # OpenAI / ElevenLabs TTS
-            └── ffmpeg_compose.py   # ffmpeg-python video assembly
+            └── ffmpeg_compose.py   # FFmpeg CLI video assembly
 ```
 
 For architecture decisions, agent roles, checkpoint map, cost flow and design
